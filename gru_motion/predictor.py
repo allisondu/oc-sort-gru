@@ -6,20 +6,27 @@ import numpy as np
 import torch
 
 from .features import cxcywh_to_xyxy, decode_outputs, encode_windows
-from .model import load_checkpoint
+from .model import conservative_support, load_checkpoint, validate_support
 
 
 class GRUBoxPredictor(object):
-    def __init__(self, model, history_len, device="cpu", meta=None):
+    """
+    `support` = the checkpoint's inference_support (which windows the model may
+    be given). It is enforced by the tracker (trackers/ocsort_gru); when built
+    without a checkpoint (tests), it defaults to the most conservative support.
+    """
+    def __init__(self, model, history_len, device="cpu", meta=None, support=None):
         self.model = model.to(device).eval()
         self.history_len = int(history_len)
         self.device = torch.device(device)
         self.meta = meta or {}
+        self.support = dict(support) if support is not None else conservative_support(self.history_len)
+        validate_support(self.support, self.history_len)
 
     @classmethod
     def from_checkpoint(cls, path, device="cpu"):
         model, meta = load_checkpoint(path, map_location="cpu")
-        return cls(model, meta["history_len"], device=device, meta=meta)
+        return cls(model, meta["history_len"], device=device, meta=meta, support=meta["inference_support"])
 
     def predict_xyxy(self, boxes, mask):
         """

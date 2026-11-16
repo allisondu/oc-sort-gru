@@ -1,0 +1,182 @@
+{
+  "dataset": "DanceTrack train split (huggingface.co/datasets/noahcao/dancetrack, train1.zip + train2.zip)",
+  "split_id": "dancetrack-train-gru-holdout-v2",
+  "split_version": 2,
+  "unit": "whole video sequence",
+  "method": "stratified: one sequence per crowding (objs_mean) bin; coverage constraints on percentile ranks of cv_err_median, turn_rate, overlap_rate, gap_rate (min<=0.35, max>=0.65, mean in [0.35,0.65]); >=1 1280x720 and >=1 1920x1080; holdout box share in [0.09,0.16]; seeded uniform choice among feasible candidates (see tools/make_gru_split.py)",
+  "seed": 0,
+  "num_train_sequences": 35,
+  "num_holdout_sequences": 5,
+  "train_sequences": [
+    "dancetrack0001",
+    "dancetrack0002",
+    "dancetrack0006",
+    "dancetrack0008",
+    "dancetrack0012",
+    "dancetrack0015",
+    "dancetrack0016",
+    "dancetrack0020",
+    "dancetrack0023",
+    "dancetrack0024",
+    "dancetrack0029",
+    "dancetrack0032",
+    "dancetrack0033",
+    "dancetrack0037",
+    "dancetrack0039",
+    "dancetrack0044",
+    "dancetrack0045",
+    "dancetrack0049",
+    "dancetrack0051",
+    "dancetrack0052",
+    "dancetrack0053",
+    "dancetrack0057",
+    "dancetrack0061",
+    "dancetrack0062",
+    "dancetrack0068",
+    "dancetrack0069",
+    "dancetrack0072",
+    "dancetrack0074",
+    "dancetrack0075",
+    "dancetrack0080",
+    "dancetrack0083",
+    "dancetrack0086",
+    "dancetrack0087",
+    "dancetrack0096",
+    "dancetrack0099"
+  ],
+  "holdout_sequences": [
+    "dancetrack0027",
+    "dancetrack0055",
+    "dancetrack0066",
+    "dancetrack0082",
+    "dancetrack0098"
+  ],
+  "excluded_official_validation_sequences": [
+    "dancetrack0004",
+    "dancetrack0005",
+    "dancetrack0007",
+    "dancetrack0010",
+    "dancetrack0014",
+    "dancetrack0018",
+    "dancetrack0019",
+    "dancetrack0025",
+    "dancetrack0026",
+    "dancetrack0030",
+    "dancetrack0034",
+    "dancetrack0035",
+    "dancetrack0041",
+    "dancetrack0043",
+    "dancetrack0047",
+    "dancetrack0058",
+    "dancetrack0063",
+    "dancetrack0065",
+    "dancetrack0073",
+    "dancetrack0077",
+    "dancetrack0079",
+    "dancetrack0081",
+    "dancetrack0090",
+    "dancetrack0094",
+    "dancetrack0097"
+  ],
+  "dataset_manifest": {
+    "path": "datasets_gru/dancetrack_gt/train/FETCH_MANIFEST.json",
+    "sha256": "095efe654bdddd85d9f4cc79957d39953442a8a3ff10fcfa72b4064fd566c364"
+  },
+  "selection_details": {
+    "crowding_bins": [
+      [
+        "dancetrack0052",
+        "dancetrack0074",
+        "dancetrack0057",
+        "dancetrack0055",
+        "dancetrack0039",
+        "dancetrack0072",
+        "dancetrack0053",
+        "dancetrack0068"
+      ],
+      [
+        "dancetrack0061",
+        "dancetrack0066",
+        "dancetrack0062",
+        "dancetrack0032",
+        "dancetrack0016",
+        "dancetrack0069",
+        "dancetrack0024",
+        "dancetrack0029"
+      ],
+      [
+        "dancetrack0075",
+        "dancetrack0037",
+        "dancetrack0001",
+        "dancetrack0098",
+        "dancetrack0002",
+        "dancetrack0008",
+        "dancetrack0033",
+        "dancetrack0049"
+      ],
+      [
+        "dancetrack0027",
+        "dancetrack0023",
+        "dancetrack0006",
+        "dancetrack0015",
+        "dancetrack0051",
+        "dancetrack0080",
+        "dancetrack0099",
+        "dancetrack0087"
+      ],
+      [
+        "dancetrack0012",
+        "dancetrack0044",
+        "dancetrack0045",
+        "dancetrack0086",
+        "dancetrack0082",
+        "dancetrack0083",
+        "dancetrack0096",
+        "dancetrack0020"
+      ]
+    ],
+    "num_candidates": 32768,
+    "num_feasible": 7503,
+    "coverage_metrics": [
+      "cv_err_median",
+      "turn_rate",
+      "overlap_rate",
+      "gap_rate"
+    ],
+    "holdout_box_share": 0.10337603530794143,
+    "holdout_percentile_ranks": {
+      "cv_err_median": {
+        "dancetrack0027": 0.333,
+        "dancetrack0055": 1.0,
+        "dancetrack0066": 0.769,
+        "dancetrack0082": 0.462,
+        "dancetrack0098": 0.231
+      },
+      "turn_rate": {
+        "dancetrack0027": 0.051,
+        "dancetrack0055": 0.974,
+        "dancetrack0066": 0.436,
+        "dancetrack0082": 0.513,
+        "dancetrack0098": 0.462
+      },
+      "overlap_rate": {
+        "dancetrack0027": 0.821,
+        "dancetrack0055": 0.026,
+        "dancetrack0066": 0.154,
+        "dancetrack0082": 0.795,
+        "dancetrack0098": 0.846
+      },
+      "gap_rate": {
+        "dancetrack0027": 0.974,
+        "dancetrack0055": 0.897,
+        "dancetrack0066": 0.038,
+        "dancetrack0082": 0.282,
+        "dancetrack0098": 0.949
+      }
+    },
+    "stats_file": {
+      "path": "configs/gru/dancetrack_train_sequence_stats.json",
+      "sha256": "38875e582fd712a88908f9405a9b1de01cee35168ab9836e2994eb88983dc4df"
+    }
+  }
+}

@@ -155,3 +155,5 @@ baseline_results/visualizations/*.mp4
 baseline_results/visualizations/*.gif
 baseline_results/det_cache_smoke_*/
 .DS_Store
+/datasets_gru
+/gru_runs

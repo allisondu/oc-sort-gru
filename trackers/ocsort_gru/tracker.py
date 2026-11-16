@@ -10,14 +10,23 @@ What changes vs. OCSort (only _predict_boxes / _new_track are overridden):
     associate() (IoU + OCM cost, first round) is replaced by the GRU box.
     With use_byte=True those same rows are also used by the BYTE round.
   * OCM still uses observation-derived velocities and k_previous_obs; OCR still
-    uses last_observation; output boxes are still last_observation. None of
-    these read the predicted boxes, so they behave exactly as in OC-SORT.
+    uses last_observation; output boxes are still last_observation.
 
-Eligibility for a GRU prediction (otherwise the Kalman box is kept):
-  * trailing gap: the last real observation is at most `max_gap` frames before
-    the current frame (max_gap=1 -> observed in the previous frame);
-  * at least `min_obs` valid observations inside the L-frame window;
-  * the decoded GRU box is finite with positive width/height.
+Three different per-track quantities (do not conflate them):
+  * track age        trk.age: frames since the track was born (grows every frame).
+  * num_valid        real observations inside the L-frame window (<= L).
+  * frames since last observation  trk.time_since_update after predict()
+                     (1 = observed in the previous frame); the window's
+                     trailing gap = frames_since_last_obs - 1.
+
+Eligibility = the checkpoint's inference_support, optionally narrowed at runtime:
+  1. trailing gap <= max_trailing_gap        (else fallback_missing_recent_observation
+                                               if the limit is 0, else fallback_unsupported_gap)
+  2. num_valid >= min_valid_obs              (else fallback_insufficient_history)
+     (standard checkpoints have min_valid_obs = L, i.e. full history)
+  3. decoded box finite with positive size   (else fallback_invalid_output)
+Runtime settings may only be MORE restrictive than the checkpoint; anything
+broader raises ValueError (never silently widened or clipped).
 """
 import numpy as np
 
@@ -25,20 +34,39 @@ from gru_motion.features import window_stats
 from trackers.ocsort_tracker.ocsort import OCSort
 from .history import track_window
 
+STAT_KEYS = ("track_predictions", "gru_used", "fallback_missing_recent_observation",
+             "fallback_unsupported_gap", "fallback_insufficient_history", "fallback_invalid_output")
+DECISION_COLUMNS = ("frame", "track_id", "track_age", "total_observations", "num_valid_in_window",
+                    "frames_since_last_obs", "decision")
+
+
+def effective_policy(support, min_obs=None, max_trailing_gap=None):
+    """
+    Combine checkpoint support with optional runtime overrides.
+    None -> use the checkpoint's value. Broader-than-checkpoint -> ValueError.
+    """
+    L = support["history_len"]
+    mv = support["min_valid_obs"] if min_obs is None else int(min_obs)
+    gap = support["max_trailing_gap"] if max_trailing_gap is None else int(max_trailing_gap)
+    if mv < support["min_valid_obs"] or mv > L:
+        raise ValueError("min_obs={} not allowed: checkpoint supports min_valid_obs >= {} (history_len {}){}".format(
+            mv, support["min_valid_obs"], L,
+            " -- this is a full-history (standard) checkpoint" if support["require_full_history"] else ""))
+    if gap < 0 or gap > support["max_trailing_gap"]:
+        raise ValueError("max_trailing_gap={} not allowed: checkpoint supports at most {}".format(
+            gap, support["max_trailing_gap"]))
+    return {"history_len": L, "min_valid_obs": mv, "max_trailing_gap": gap,
+            "require_full_history": mv == L, "prediction_horizons": list(range(1, gap + 2))}
+
 
 class OCSortGRU(OCSort):
-    def __init__(self, det_thresh, predictor, max_gap=1, min_obs=3, **kwargs):
+    def __init__(self, det_thresh, predictor, min_obs=None, max_trailing_gap=None,
+                 log_decisions=False, **kwargs):
         super().__init__(det_thresh, **kwargs)
-        L = predictor.history_len
-        if not (1 <= max_gap <= L - 1):
-            raise ValueError("max_gap must be in [1, history_len-1={}], got {}".format(L - 1, max_gap))
-        if not (2 <= min_obs <= L):
-            raise ValueError("min_obs must be in [2, history_len={}], got {}".format(L, min_obs))
         self.predictor = predictor
-        self.max_gap = int(max_gap)
-        self.min_obs = int(min_obs)
-        self.stats = {"track_predictions": 0, "gru": 0, "fallback_gap": 0,
-                      "fallback_short_history": 0, "fallback_invalid_output": 0}
+        self.policy = effective_policy(predictor.support, min_obs, max_trailing_gap)
+        self.stats = {k: 0 for k in STAT_KEYS}
+        self.decision_log = [] if log_decisions else None
 
     def _new_track(self, det):
         trk = super()._new_track(det)
@@ -50,27 +78,36 @@ class OCSortGRU(OCSort):
         n = len(self.trackers)
         if n == 0:
             return trks
-        L = self.predictor.history_len
+        L = self.policy["history_len"]
         boxes = np.zeros((n, L, 4))
         masks = np.zeros((n, L))
         for i, trk in enumerate(self.trackers):
             boxes[i], masks[i] = track_window(trk, L)
-        num_valid, trailing = window_stats(masks)
-        gap_ok = trailing + 1 <= self.max_gap          # frames since last observation
-        hist_ok = num_valid >= self.min_obs
-        eligible = np.flatnonzero(gap_ok & hist_ok)
+        num_valid, trailing = window_stats(masks)       # trailing == L if no obs in window
+
+        decision = np.full(n, "gru_used", dtype=object)
+        gap_bad = trailing > self.policy["max_trailing_gap"]
+        decision[gap_bad] = ("fallback_missing_recent_observation" if self.policy["max_trailing_gap"] == 0
+                             else "fallback_unsupported_gap")
+        hist_bad = ~gap_bad & (num_valid < self.policy["min_valid_obs"])
+        decision[hist_bad] = "fallback_insufficient_history"
+        eligible = np.flatnonzero(~gap_bad & ~hist_bad)
+
+        if len(eligible):
+            pred = self.predictor.predict_xyxy(boxes[eligible], masks[eligible])
+            ok = np.all(np.isfinite(pred), axis=1) & (pred[:, 2] > pred[:, 0]) & (pred[:, 3] > pred[:, 1])
+            decision[eligible[~ok]] = "fallback_invalid_output"
+            trks[eligible[ok], :4] = pred[ok]
 
         self.stats["track_predictions"] += n
-        self.stats["fallback_gap"] += int((~gap_ok).sum())
-        self.stats["fallback_short_history"] += int((gap_ok & ~hist_ok).sum())
-        if len(eligible) == 0:
-            return trks
-
-        pred = self.predictor.predict_xyxy(boxes[eligible], masks[eligible])
-        ok = np.all(np.isfinite(pred), axis=1) & (pred[:, 2] > pred[:, 0]) & (pred[:, 3] > pred[:, 1])
-        self.stats["fallback_invalid_output"] += int((~ok).sum())
-        self.stats["gru"] += int(ok.sum())
-        trks[eligible[ok], :4] = pred[ok]
+        for d in decision:
+            self.stats[d] += 1
+        if self.decision_log is not None:
+            for i, trk in enumerate(self.trackers):
+                birth_extra = int(getattr(trk, "gru_birth_obs", None) is not None and 0 not in trk.observations)
+                self.decision_log.append((self.frame_count, trk.id + 1, trk.age,
+                                          len(trk.observations) + birth_extra, int(num_valid[i]),
+                                          trk.time_since_update, decision[i]))
         return trks
 
     def update_public(self, *args, **kwargs):

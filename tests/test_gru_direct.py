@@ -15,6 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from gru_motion.data import SamplingSpec
 from gru_motion import (GRUBoxPredictor, GRUCheckpointError, GRUMotionModel, build_window,
                         decode_outputs, encode_targets, encode_windows, load_checkpoint, save_checkpoint)
 from gru_motion.features import cxcywh_to_xyxy, window_stats, xyxy_to_cxcywh
@@ -67,46 +68,105 @@ def _fixture_model(seed=0):
     return GRUMotionModel(hidden_size=64, num_layers=1)
 
 
+def _save_fixture(path, mode, epochs=1, windows=1, model=None, **support_override):
+    spec = SamplingSpec.make(mode, 10)
+    support = None
+    if support_override:
+        from gru_motion.model import support_from_training
+        support = dict(support_from_training(spec.training_conditions()), **support_override)
+    save_checkpoint(path, model or _fixture_model(), spec.training_conditions(),
+                    {"epochs": epochs, "num_train_windows": windows, "note": "test fixture"}, support)
+    return path
+
+
+def _expect(exc, fn, *a, **k):
+    try:
+        fn(*a, **k)
+    except exc as e:
+        return e
+    raise AssertionError("expected {}".format(exc.__name__))
+
+
+# ----------------------------------------------------------------------------- checkpoints
+
 def test_checkpoint_validation():
     with tempfile.TemporaryDirectory() as d:
         for bad in (None, os.path.join(d, "missing.pt")):
-            try:
-                load_checkpoint(bad)
-                raise AssertionError("accepted missing checkpoint")
-            except GRUCheckpointError:
-                pass
-        untrained = os.path.join(d, "untrained.pt")
-        save_checkpoint(untrained, _fixture_model(), 10, {"epochs": 0, "num_train_windows": 0})
-        try:
-            load_checkpoint(untrained)
-            raise AssertionError("accepted checkpoint without training record")
-        except GRUCheckpointError as e:
-            assert "no record of training" in str(e)
+            _expect(GRUCheckpointError, load_checkpoint, bad)
+        untrained = _save_fixture(os.path.join(d, "untrained.pt"), "standard", epochs=0, windows=0)
+        assert "no record of training" in str(_expect(GRUCheckpointError, load_checkpoint, untrained))
         foreign = os.path.join(d, "foreign.pt")
         torch.save({"model": {}}, foreign)
-        try:
-            load_checkpoint(foreign)
-            raise AssertionError("accepted foreign checkpoint")
-        except GRUCheckpointError:
-            pass
-        ok = os.path.join(d, "ok.pt")
+        _expect(GRUCheckpointError, load_checkpoint, foreign)
         m = _fixture_model()
-        save_checkpoint(ok, m, 10, {"epochs": 1, "num_train_windows": 1, "note": "test fixture"})
+        ok = _save_fixture(os.path.join(d, "ok.pt"), "partial", model=m)
+        # load_checkpoint uses torch.load(weights_only=True)
         m2, meta = load_checkpoint(ok)
         x = torch.randn(3, 10, 5)
         x[..., 4] = 1
         assert torch.allclose(m.predict(x), m2.predict(x))
-        assert meta["history_len"] == 10 and len(meta["sha256"]) == 64
+        assert meta["format"].endswith("/v2") and not meta["legacy_checkpoint"]
+        assert meta["training_conditions"]["training_mode"] == "partial"
+        assert meta["inference_support"] == {"history_len": 10, "min_valid_obs": 3, "require_full_history": False,
+                                             "max_trailing_gap": 0, "prediction_horizons": [1]}
 
 
-def _synthetic_frames(n_frames=60, n_obj=4, seed=0):
-    """Objects on curved paths with occasional missed detections -> list of (N,5) arrays."""
+def test_support_cannot_exceed_training():
+    with tempfile.TemporaryDirectory() as d:
+        # broader-than-training support is refused at save time
+        _expect(ValueError, _save_fixture, os.path.join(d, "a.pt"), "standard",
+                min_valid_obs=3, require_full_history=False)
+        _expect(ValueError, _save_fixture, os.path.join(d, "b.pt"), "partial",
+                max_trailing_gap=2, prediction_horizons=[1, 2, 3])
+        # narrower support is allowed
+        _save_fixture(os.path.join(d, "c.pt"), "partial", min_valid_obs=5)
+        # a tampered file claiming broader support is refused at load time
+        p = _save_fixture(os.path.join(d, "t.pt"), "standard")
+        ck = torch.load(p, weights_only=True)
+        ck["inference_support"].update(min_valid_obs=3, require_full_history=False)
+        torch.save(ck, p)
+        assert "below what training saw" in str(_expect(GRUCheckpointError, load_checkpoint, p))
+
+
+def test_legacy_checkpoint_is_conservative():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "v1.pt")
+        m = _fixture_model()
+        torch.save({"format": "oc-sort-gru/motion-checkpoint/v1", "feature_version": 1, "history_len": 10,
+                    "model_config": m.config, "state_dict": m.state_dict(),
+                    "train_info": {"epochs": 3, "num_train_windows": 2000}}, p)
+        _, meta = load_checkpoint(p)
+        assert meta["legacy_checkpoint"] and meta["training_conditions"] is None
+        assert meta["inference_support"]["min_valid_obs"] == 10
+        assert meta["inference_support"]["max_trailing_gap"] == 0
+        # and the tracker refuses to widen it
+        pred = GRUBoxPredictor.from_checkpoint(p)
+        _expect(ValueError, OCSortGRU, det_thresh=0.6, predictor=pred, min_obs=3)
+
+
+def test_runtime_policy_only_narrows():
+    from trackers.ocsort_gru.tracker import effective_policy
+    std = GRUBoxPredictor(_fixture_model(), 10)   # no support given -> conservative (full-history) support
+    par_support = {"history_len": 10, "min_valid_obs": 3, "require_full_history": False,
+                   "max_trailing_gap": 0, "prediction_horizons": [1]}
+    assert effective_policy(std.support)["min_valid_obs"] == 10
+    _expect(ValueError, effective_policy, std.support, min_obs=3)            # broader -> rejected
+    _expect(ValueError, effective_policy, par_support, min_obs=2)
+    _expect(ValueError, effective_policy, par_support, max_trailing_gap=1)
+    assert effective_policy(par_support, min_obs=6)["min_valid_obs"] == 6   # stricter -> fine
+    assert effective_policy(par_support)["min_valid_obs"] == 3
+
+
+# ----------------------------------------------------------------------------- tracker integration
+
+def _synthetic_frames(n_frames=80, n_obj=4, seed=0, miss=0.15):
+    """Objects on curved paths with missed detections -> list of (N,5) arrays."""
     rng = np.random.default_rng(seed)
     frames = []
     for t in range(n_frames):
         dets = []
         for k in range(n_obj):
-            if rng.random() < 0.1:
+            if rng.random() < miss:
                 continue                                   # missed detection
             cx = 200 + 300 * k + 40 * np.sin(t / 6.0 + k)
             cy = 400 + 30 * np.cos(t / 5.0 + k)
@@ -115,37 +175,64 @@ def _synthetic_frames(n_frames=60, n_obj=4, seed=0):
     return frames
 
 
-def test_tracker_window_timing():
-    model = _fixture_model()
-    pred = GRUBoxPredictor(model, history_len=10)
-    trk_gru = OCSortGRU(det_thresh=0.6, predictor=pred, max_gap=1, min_obs=3)
-    checks = {"windows": 0}
-    orig = trk_gru._predict_boxes
+class _SentinelPredictor(object):
+    """Returns a recognisable box so we can tell GRU rows from Kalman rows."""
+    def __init__(self, support):
+        self.history_len, self.support, self.calls = 10, support, []
 
-    def checked_predict_boxes():
-        # Kalman-only boxes computed the upstream way must equal what the GRU
-        # tracker's Kalman filters predicted (GRU must not touch KF state).
-        trks = orig()
-        for i, t in enumerate(trk_gru.trackers):
-            kf_box = t.history[-1][0]                      # Kalman box appended by predict()
-            assert np.all(np.isfinite(kf_box))
-            assert all(k < t.age for k in t.observations)  # no current/future observations
-            boxes, mask = track_window(t, 10)
-            nv, tr = window_stats(mask)
-            if t.last_observation.sum() >= 0 and t.time_since_update <= 10:
-                assert tr + 1 == t.time_since_update        # window gap == frames since last obs
-                assert np.allclose(cxcywh_to_xyxy(boxes[9 - tr]), t.last_observation[:4])
-            checks["windows"] += 1
+    def predict_xyxy(self, boxes, mask):
+        self.calls.append(mask.copy())
+        return np.tile([1.0, 2.0, 3.0, 4.0], (len(boxes), 1))
+
+
+def _run_policy(support, check_rows=True):
+    pred = _SentinelPredictor(support)
+    trk = OCSortGRU(det_thresh=0.6, predictor=pred, log_decisions=True)
+    orig = OCSortGRU._predict_boxes
+
+    def checked():
+        trks = orig(trk)
+        start = len(trk.decision_log) - len(trk.trackers)
+        for i, t in enumerate(trk.trackers):
+            dec = trk.decision_log[start + i][-1]
+            assert all(k < t.age for k in t.observations)            # no current/future observations
+            if dec == "gru_used":
+                assert np.allclose(trks[i, :4], [1, 2, 3, 4])
+            else:                                                    # Kalman fallback row untouched
+                assert np.allclose(trks[i, :4], t.history[-1][0][:4])
         return trks
-    trk_gru._predict_boxes = checked_predict_boxes
-
+    if check_rows:
+        trk._predict_boxes = checked
     for dets in _synthetic_frames():
-        x = trk_gru.update(dets.copy(), (1080, 1920), (1080, 1920))
-        assert x.shape[1] == 5
-    s = trk_gru.stats
-    assert s["gru"] > 0 and s["track_predictions"] == s["gru"] + s["fallback_gap"] + \
-        s["fallback_short_history"] + s["fallback_invalid_output"]
-    assert checks["windows"] > 0
+        trk.update(dets.copy(), (1080, 1920), (1080, 1920))
+    return trk, pred
+
+
+def test_standard_checkpoint_policy_in_tracker():
+    support = {"history_len": 10, "min_valid_obs": 10, "require_full_history": True,
+               "max_trailing_gap": 0, "prediction_horizons": [1]}
+    trk, pred = _run_policy(support)
+    s = trk.stats
+    assert s["track_predictions"] == sum(v for k, v in s.items() if k != "track_predictions")
+    assert s["gru_used"] > 0 and s["fallback_insufficient_history"] > 0
+    assert s["fallback_missing_recent_observation"] > 0 and s["fallback_unsupported_gap"] == 0
+    for _, _, age, total, nv, since, dec in trk.decision_log:
+        assert nv <= min(total, 10) and nv <= age                    # age / total / window counts differ
+        if dec == "gru_used":
+            assert nv == 10 and since == 1                           # full history, last frame observed
+    assert all(m.all() for m in pred.calls)                          # model only ever saw full windows
+
+
+def test_partial_checkpoint_policy_in_tracker():
+    support = {"history_len": 10, "min_valid_obs": 3, "require_full_history": False,
+               "max_trailing_gap": 0, "prediction_horizons": [1]}
+    trk, pred = _run_policy(support)
+    used = [r for r in trk.decision_log if r[-1] == "gru_used"]
+    assert any(r[4] < 10 for r in used)                              # incomplete histories accepted
+    assert all(r[4] >= 3 and r[5] == 1 for r in used)                # min obs + recent obs enforced
+    assert trk.stats["fallback_missing_recent_observation"] > 0
+    for m in pred.calls:
+        assert np.all(m[:, -1] == 1) and np.all(m.sum(1) >= 3)
 
 
 def test_kalman_box_equivalence_when_gru_returns_kalman():
@@ -153,12 +240,14 @@ def test_kalman_box_equivalence_when_gru_returns_kalman():
     Exercises row alignment between eligible tracks, predictions and `trks`."""
     class KalmanEcho(object):
         history_len = 10
+        support = {"history_len": 10, "min_valid_obs": 3, "require_full_history": False,
+                   "max_trailing_gap": 0, "prediction_horizons": [1]}
         tracker = None
 
         def predict_xyxy(self, boxes, mask):
             trs = self.tracker.trackers
             nv, tr = window_stats(np.array([track_window(t, 10)[1] for t in trs]))
-            elig = np.flatnonzero((tr + 1 <= self.tracker.max_gap) & (nv >= self.tracker.min_obs))
+            elig = np.flatnonzero((tr <= 0) & (nv >= 3))
             assert len(elig) == len(boxes)
             return np.array([trs[i].history[-1][0] for i in elig])   # Kalman box from predict()
 
@@ -168,11 +257,251 @@ def test_kalman_box_equivalence_when_gru_returns_kalman():
     base = OCSort(det_thresh=0.6)
     out_base = [base.update(d.copy(), (1080, 1920), (1080, 1920)) for d in frames]
     echo = KalmanEcho()
-    gru = OCSortGRU(det_thresh=0.6, predictor=echo, max_gap=1, min_obs=3)
+    gru = OCSortGRU(det_thresh=0.6, predictor=echo)
     echo.tracker = gru
     out_gru = [gru.update(d.copy(), (1080, 1920), (1080, 1920)) for d in frames]
     assert all(np.array_equal(a, b) for a, b in zip(out_base, out_gru))
-    assert gru.stats["gru"] > 0
+    assert gru.stats["gru_used"] > 0
+
+
+# ----------------------------------------------------------------------------- data / training modes
+
+def _write_gt(d, rows):
+    p = os.path.join(d, "gt.txt")
+    open(p, "w").write("\n".join(rows) + "\n")
+    return p
+
+
+def test_gt_loader_and_window_sampling():
+    """Parser edge cases + standard windows never cross gaps; targets align with GT."""
+    from gru_motion.data import build_arrays, enumerate_samples, load_gt, subsample
+    rows = []
+    for f in range(1, 16):                        # id 0: frames 1..15, gap at 8
+        if f != 8:
+            rows.append("{},0,{},{},10,20,1,1,1".format(f, 100 + 2 * f, 50))
+    for f in range(1, 13):                        # id 1: frames 1..12, consecutive
+        rows.append("{},1,{},{},12,24,1,1,1".format(f, 300, 60 + 3 * f))
+    rows += ["3,2,10,10,0,20,1,1,1",              # zero width -> dropped
+             "4,2,10,10,5,nan,1,1,1",             # non-finite -> dropped
+             "5,3,10,10,5,5,1,1,1", "5,3,11,11,5,5,1,1,1"]   # duplicate (frame,id) -> both dropped
+    with tempfile.TemporaryDirectory() as d:
+        tracks, st = load_gt(_write_gt(d, rows))
+    assert st["dropped_malformed"] == 2 and st["dropped_duplicate"] == 2
+    assert sorted(tracks) == [0, 1]
+    spec = SamplingSpec.make("standard", history_len=5)
+    data = {"seqA": tracks}
+    s = enumerate_samples(data, spec)
+    # id 0 (gap at 8): target t needs frames t-5..t all annotated -> t in {6, 7, 14, 15}
+    assert [x[2] for x in s if x[1] == 0] == [6, 7, 14, 15]
+    assert [x[2] for x in s if x[1] == 1] == list(range(6, 13))
+    assert subsample(s, 4, 0) == subsample(s, 4, 0) and len(subsample(s, 4, 0)) == 4
+    feats, targets, ref = build_arrays(data, s, spec)
+    assert feats.shape == (len(s), 5, 5) and np.all(feats[..., 4] == 1)
+    dec = decode_outputs(targets, ref)
+    for j, (_, tid, t) in enumerate(s):
+        assert np.allclose(cxcywh_to_xyxy(dec[j]), tracks[tid][t])          # target = GT at t
+        assert np.allclose(cxcywh_to_xyxy(ref[j]), tracks[tid][t - 1])      # reference = GT at t-1
+
+
+def test_training_modes():
+    from gru_motion.data import build_arrays, enumerate_samples
+    # one track, frames 1..20 with frames 5 and 12 missing
+    frames = {f: np.array([10.0 * f, 0, 10.0 * f + 10, 20]) for f in range(1, 21) if f not in (5, 12)}
+    data = {"s": {7: frames}}
+    std = SamplingSpec.make("standard", 5)
+    par = SamplingSpec.make("partial", 5, min_valid_obs=3)
+    ts = [t for _, _, t in enumerate_samples(data, std)]
+    tp = [t for _, _, t in enumerate_samples(data, par)]
+    # standard: t and t-5..t-1 all present
+    assert ts == [t for t in sorted(frames) if all(t - k in frames for k in range(1, 6))]
+    # partial: t present, t-1 present, >= 3 of t-5..t-1 present
+    exp = [t for t in sorted(frames) if (t - 1) in frames and sum((t - k) in frames for k in range(1, 6)) >= 3]
+    assert tp == exp and set(ts) < set(tp)
+    assert 4 in tp and 4 not in ts                 # short history (3 obs: frames 1..3) accepted by partial only
+    assert 6 not in tp and 13 not in tp            # most recent frame (5 / 12) missing -> rejected
+    assert 3 not in tp                             # only 2 obs -> below min_valid_obs
+    feats, _, _ = build_arrays(data, [("s", 7, 9)], par)       # window = frames 4..8, frame 5 missing
+    assert feats[0, :, 4].tolist() == [1, 0, 1, 1, 1] and np.all(feats[0, 1, :4] == 0)
+    # partial min_valid_obs enforced: requiring all 5 reproduces standard
+    t5 = [t for _, _, t in enumerate_samples(data, SamplingSpec.make("partial", 5, min_valid_obs=5))]
+    assert t5 == ts
+    # invalid specs
+    _expect(ValueError, SamplingSpec.make, "partial", 5, None, 1)            # gap-aware not implemented
+    _expect(ValueError, SamplingSpec.make, "standard", 10, 3)                # standard is always full
+    _expect(ValueError, SamplingSpec.make, "gap_aware", 10)
+
+
+def test_no_leakage_and_no_identity_or_video_crossing():
+    from gru_motion.data import build_arrays, enumerate_samples
+    def track(x0, n=30):
+        return {f: np.array([x0 + f, 0.0, x0 + f + 10, 20.0]) for f in range(1, n + 1)}
+    data = {"seqA": {0: track(0), 1: track(1000)}, "seqB": {0: track(5000)}}
+    for spec in (SamplingSpec.make("standard", 10), SamplingSpec.make("partial", 10)):
+        s = enumerate_samples(data, spec)
+        f1, t1, r1 = build_arrays(data, s, spec)
+        # every window's boxes come from its own track: positions are within ~10 frames of the reference
+        assert np.all(np.abs(f1[..., 0]) * 20 < 15)
+        # poison every frame >= target: inputs must not change
+        for j, (seq, tid, t) in enumerate(s[:40]):
+            pois = {k: dict(v) for k, v in data[seq].items()}
+            for f in pois[tid]:
+                if f >= t:
+                    pois[tid][f] = pois[tid][f] + 777.0
+            f2, _, _ = build_arrays({seq: pois}, [(seq, tid, t)], spec)
+            assert np.array_equal(f1[j], f2[0])
+
+
+# ----------------------------------------------------------------------------- dataset / split
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DATA = os.path.join(_ROOT, "datasets_gru", "dancetrack_gt")
+_SPLIT = os.path.join(_ROOT, "configs", "gru", "dancetrack_split.json")
+
+
+def test_dataset_and_split():
+    if not os.path.isdir(os.path.join(_DATA, "train")):
+        print("  (skipped: datasets_gru not present)")
+        return
+    import json
+    import zlib
+    from gru_motion.data import DANCETRACK_VAL_SEQUENCES, list_sequences, load_gt, load_split_config
+    names = [os.path.basename(d) for d in list_sequences(_DATA, "train")]
+    assert len(names) == 40 and not (set(names) & DANCETRACK_VAL_SEQUENCES)
+    man = json.load(open(os.path.join(_DATA, "train", "FETCH_MANIFEST.json")))
+    for n in names:
+        for suf in ("gt/gt.txt", "seqinfo.ini"):
+            e = man["{}/{}".format(n, suf)]
+            raw = open(os.path.join(_DATA, "train", n, suf), "rb").read()
+            assert len(raw) == e["bytes"] and "{:08x}".format(zlib.crc32(raw) & 0xFFFFFFFF) == e["crc32"]
+        tracks, st = load_gt(os.path.join(_DATA, "train", n, "gt", "gt.txt"))
+        assert st["boxes"] > 0 and st["dropped_malformed"] == 0 and st["dropped_duplicate"] == 0
+    cfg, tr, ho, sha = load_split_config(_SPLIT, _DATA)
+    cfg2, tr2, ho2, sha2 = load_split_config(_SPLIT, _DATA)
+    assert sha == sha2 and tr == tr2 and ho == ho2                   # deterministic reuse
+    assert not (set(cfg["train_sequences"]) & set(cfg["holdout_sequences"]))
+    assert sorted(cfg["train_sequences"] + cfg["holdout_sequences"]) == sorted(names)
+    # regenerating with the recorded seed/method reproduces the same holdout
+    perm = np.random.default_rng(cfg["seed"]).permutation(len(names))
+    assert sorted(sorted(names)[i] for i in perm[:cfg["num_holdout_sequences"]]) == cfg["holdout_sequences"]
+    # invalid split files are rejected
+    with tempfile.TemporaryDirectory() as d:
+        for bad in ({"train_sequences": names[:3], "holdout_sequences": names[2:4]},
+                    {"train_sequences": names[:3] + ["dancetrack0004"], "holdout_sequences": []},
+                    {"train_sequences": ["dancetrack9999"], "holdout_sequences": []}):
+            p = os.path.join(d, "s.json")
+            json.dump(bad, open(p, "w"))
+            _expect(ValueError, load_split_config, p, _DATA)
+
+
+# ----------------------------------------------------------------------------- best / last checkpoints
+
+def _tiny_train(out_dir, epochs, holdout_script=None, extra=()):
+    """Tiny real-data run (2 train seqs, 1 holdout seq from the TRAIN split). holdout_script
+    replaces the holdout loss values per epoch (index 0 = before training)."""
+    import gru_motion.train as T
+    real = T.eval_loss
+    calls = {"n": 0}
+
+    def scripted(model, x, y, bs):
+        if holdout_script is not None and x is not None and len(x) == scripted.hold_n:
+            v = holdout_script[calls["n"]]
+            calls["n"] += 1
+            real(model, x, y, bs)                      # still exercise the real eval path
+            return v
+        return real(model, x, y, bs)
+    scripted.hold_n = None
+
+    T.eval_loss = scripted
+    try:
+        argv = ["--data_root", _DATA, "--seqs", "dancetrack0001", "dancetrack0002", "dancetrack0006",
+                "--holdout_seqs", "dancetrack0006", "--training_mode", "standard", "--max_windows", "300",
+                "--epochs", str(epochs), "--batch_size", "64", "--seed", "0", "--out_dir", out_dir] + list(extra)
+        # holdout size = number of standard windows of dancetrack0006
+        from gru_motion.data import enumerate_samples, load_sequences
+        hd, _ = load_sequences([os.path.join(_DATA, "train", "dancetrack0006")])
+        scripted.hold_n = len(enumerate_samples(hd, SamplingSpec.make("standard", 10)))
+        return T.main(argv)
+    finally:
+        T.eval_loss = real
+
+
+def _state(path):
+    return torch.load(path, weights_only=True)["state_dict"]
+
+
+def test_best_and_last_checkpoint_selection():
+    if not os.path.isdir(os.path.join(_DATA, "train")):
+        print("  (skipped: datasets_gru not present)")
+        return
+    import hashlib
+    split_hash = hashlib.sha256(open(_SPLIT, "rb").read()).hexdigest()
+    with tempfile.TemporaryDirectory() as d:
+        # holdout improves until epoch 2, worsens at epoch 3
+        a = os.path.join(d, "a")
+        _tiny_train(a, 3, holdout_script=[0.50, 0.40, 0.30, 0.35])
+        best, last = torch.load(os.path.join(a, "best.pt"), weights_only=True), \
+            torch.load(os.path.join(a, "last.pt"), weights_only=True)
+        bi, li = best["train_info"], last["train_info"]
+        assert bi["checkpoint"]["kind"] == "best" and bi["checkpoint"]["weights_epoch"] == 2
+        assert bi["checkpoint"]["holdout_loss"] == 0.30 and bi["checkpoint"]["status"] == "final"
+        assert bi["epochs"] == 2 and bi["epochs_completed"] == 3 and len(bi["loss_history"]) == 4
+        assert li["checkpoint"]["kind"] == "last" and li["checkpoint"]["weights_epoch"] == 3 and li["epochs"] == 3
+        assert bi["normalization"] == li["normalization"] and bi["config"] == li["config"]
+        # best.pt weights are exactly the epoch-2 weights: a deterministic 2-epoch rerun reproduces them
+        b = os.path.join(d, "b")
+        _tiny_train(b, 2)
+        s2, sb, sl = _state(os.path.join(b, "last.pt")), best["state_dict"], last["state_dict"]
+        assert all(torch.equal(s2[k], sb[k]) for k in sb)
+        assert not all(torch.equal(sl[k], sb[k]) for k in sb)
+        # both load through the normal validation path and the tracker enforces full history
+        for name in ("best.pt", "last.pt"):
+            pred = GRUBoxPredictor.from_checkpoint(os.path.join(a, name))
+            assert pred.support["min_valid_obs"] == 10 and pred.support["require_full_history"]
+            _expect(ValueError, OCSortGRU, det_thresh=0.6, predictor=pred, min_obs=3)
+        # ties keep the earliest epoch
+        c = os.path.join(d, "c")
+        _tiny_train(c, 3, holdout_script=[0.50, 0.30, 0.30, 0.40])
+        assert torch.load(os.path.join(c, "best.pt"), weights_only=True)["train_info"]["checkpoint"]["weights_epoch"] == 1
+        # epoch 0 (untrained) is never eligible, even if it has the lowest holdout loss
+        e0 = os.path.join(d, "e0")
+        _tiny_train(e0, 2, holdout_script=[0.10, 0.40, 0.50])
+        assert torch.load(os.path.join(e0, "best.pt"), weights_only=True)["train_info"]["checkpoint"]["weights_epoch"] == 1
+        # optional early stopping
+        e = os.path.join(d, "e")
+        _tiny_train(e, 10, holdout_script=[0.5, 0.4, 0.45, 0.46, 0.47], extra=["--early_stop_patience", "2"])
+        li = torch.load(os.path.join(e, "last.pt"), weights_only=True)["train_info"]
+        assert li["epochs_completed"] == 3 and li["early_stopped"]
+        # no holdout -> refused, unless explicitly a smoke run (then last.pt only)
+        import gru_motion.train as T
+        base = ["--data_root", _DATA, "--seqs", "dancetrack0001", "--training_mode", "standard",
+                "--max_windows", "100", "--epochs", "1"]
+        _expect(SystemExit, T.main, base + ["--out_dir", os.path.join(d, "n")])
+        T.main(base + ["--out_dir", os.path.join(d, "s"), "--allow_no_holdout"])
+        assert os.listdir(os.path.join(d, "s")) and not os.path.exists(os.path.join(d, "s", "best.pt"))
+        assert os.path.exists(os.path.join(d, "s", "last.pt"))
+        # refuses to overwrite
+        _expect(SystemExit, T.main, base + ["--out_dir", os.path.join(d, "s"), "--allow_no_holdout"])
+    assert hashlib.sha256(open(_SPLIT, "rb").read()).hexdigest() == split_hash   # split untouched
+
+
+def test_split_v2_valid_and_reproducible():
+    p2 = os.path.join(_ROOT, "configs", "gru", "dancetrack_split_v2.json")
+    if not (os.path.exists(p2) and os.path.isdir(os.path.join(_DATA, "train"))):
+        print("  (skipped)")
+        return
+    import json
+    from gru_motion.data import load_split_config
+    cfg, tr, ho, _ = load_split_config(p2, _DATA)
+    assert cfg["split_version"] == 2 and len(ho) == 5 and len(tr) == 35
+    sys.path.insert(0, os.path.join(_ROOT, "tools"))
+    from make_gru_split import stratified_holdout
+    stats = json.load(open(os.path.join(_ROOT, "configs", "gru", "dancetrack_train_sequence_stats.json")))["sequences"]
+    hold, info = stratified_holdout(stats, 5, cfg["seed"])
+    assert hold == cfg["holdout_sequences"]
+    bins = info["crowding_bins"]
+    assert sorted(sum(1 for b in bins if n in b) for n in hold) == [1] * 5   # one per crowding bin
+    assert all(len({i for i, b in enumerate(bins) if n in b}) == 1 for n in hold)
+    assert len({next(i for i, b in enumerate(bins) if n in b) for n in hold}) == 5
 
 
 if __name__ == "__main__":

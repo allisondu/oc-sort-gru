@@ -149,11 +149,12 @@ def build_tracker(args, gru_predictor=None):
     if args.tracker == "ocsort":
         return OCSort(det_thresh=args.track_thresh, **kwargs)
     from trackers.ocsort_gru import OCSortGRU
-    return OCSortGRU(det_thresh=args.track_thresh, predictor=gru_predictor,
-                     max_gap=args.gru_max_gap, min_obs=args.gru_min_obs, **kwargs)
+    return OCSortGRU(det_thresh=args.track_thresh, predictor=gru_predictor, min_obs=args.gru_min_obs,
+                     max_trailing_gap=args.gru_max_trailing_gap,
+                     log_decisions=bool(args.gru_log_decisions), **kwargs)
 
 
-def track_sequence(args, dets, img_hw, img_size, gru_predictor=None):
+def track_sequence(args, dets, img_hw, img_size, gru_predictor=None, decisions_csv=None):
     """Mirrors the tracking part of MOTEvaluatorDance.evaluate_ocsort."""
     tracker = build_tracker(args, gru_predictor)
     results = []
@@ -173,6 +174,13 @@ def track_sequence(args, dets, img_hw, img_size, gru_predictor=None):
     elapsed = time.time() - t0
     if getattr(tracker, "stats", None):
         logger.info("  GRU usage: {}".format(tracker.stats))
+    if decisions_csv and getattr(tracker, "decision_log", None) is not None:
+        from trackers.ocsort_gru.tracker import DECISION_COLUMNS
+        os.makedirs(os.path.dirname(decisions_csv), exist_ok=True)
+        with open(decisions_csv, "w") as f:
+            f.write(",".join(DECISION_COLUMNS) + "\n")
+            for row in tracker.decision_log:
+                f.write(",".join(str(v) for v in row) + "\n")
     return results, elapsed
 
 
@@ -194,10 +202,15 @@ def main():
                         help="trained GRU checkpoint (gru_motion.save_checkpoint); required for ocsort_gru. "
                              "Architecture and history length are read from it.")
     parser.add_argument("--gru_device", default="cpu", help="device for GRU inference (cpu/cuda/mps)")
-    parser.add_argument("--gru_max_gap", type=int, default=1,
-                        help="use GRU only if the track was observed within this many frames; else Kalman")
-    parser.add_argument("--gru_min_obs", type=int, default=3,
-                        help="minimum real observations in the history window; else Kalman")
+    # Runtime limits default to the checkpoint's inference_support and may only
+    # be made STRICTER; a broader value is rejected (see trackers/ocsort_gru).
+    parser.add_argument("--gru_max_trailing_gap", type=int, default=None,
+                        help="max missing frames between the last observation and the predicted frame "
+                             "(0 = observed in the previous frame). Default: checkpoint's value")
+    parser.add_argument("--gru_log_decisions", action="store_true",
+                        help="write per-track GRU/Kalman decisions to <out>/gru_decisions/<seq>.csv")
+    parser.add_argument("--gru_min_obs", type=int, default=None,
+                        help="min real observations in the L-frame window. Default: checkpoint's value")
     args = parser.parse_args()
     if args.tracker == "ocsort" and args.gru_ckpt:
         parser.error("--gru_ckpt given but --tracker is ocsort; pass --tracker ocsort_gru")
@@ -222,10 +235,11 @@ def main():
         except GRUCheckpointError as e:
             logger.error(str(e))
             sys.exit(2)
-        L = gru_predictor.history_len
-        if not (1 <= args.gru_max_gap <= L - 1 and 2 <= args.gru_min_obs <= L):
-            parser.error("need 1 <= --gru_max_gap <= {} and 2 <= --gru_min_obs <= {} (history_len={})".format(
-                L - 1, L, L))
+        from trackers.ocsort_gru.tracker import effective_policy
+        try:
+            gru_policy = effective_policy(gru_predictor.support, args.gru_min_obs, args.gru_max_trailing_gap)
+        except ValueError as e:
+            parser.error(str(e))
 
     out_dir = os.path.join(exp.output_dir, args.expn)
     results_folder = os.path.join(out_dir, "{}_{}".format(args.expn, args.split))
@@ -239,7 +253,14 @@ def main():
                    "min_box_area": args.min_box_area}
     if gru_predictor is not None:
         tracker_cfg.update({"gru_checkpoint": gru_predictor.meta, "gru_device": args.gru_device,
-                            "gru_max_gap": args.gru_max_gap, "gru_min_obs": args.gru_min_obs})
+                            "gru_requested": {"min_obs": args.gru_min_obs,
+                                              "max_trailing_gap": args.gru_max_trailing_gap},
+                            "gru_effective_policy": gru_policy})
+        if gru_predictor.meta.get("legacy_checkpoint"):
+            logger.warning("Legacy (v1) GRU checkpoint without recorded training conditions: "
+                           "restricted to full-history, one-frame prediction")
+        logger.info("GRU effective policy: {} (checkpoint support: {})".format(
+            gru_policy, gru_predictor.support))
         logger.info("GRU checkpoint: {} (sha256 {}, history_len {}, {} params)".format(
             gru_predictor.meta["path"], gru_predictor.meta["sha256"][:12],
             gru_predictor.history_len, gru_predictor.meta["num_params"]))
@@ -287,7 +308,9 @@ def main():
         if len(dets) < n_total:
             logger.warning("{}: tracking only {}/{} frames".format(seq, len(dets), n_total))
 
-        results, track_time = track_sequence(args, dets, img_hw, exp.test_size, gru_predictor)
+        results, track_time = track_sequence(
+            args, dets, img_hw, exp.test_size, gru_predictor,
+            os.path.join(out_dir, "gru_decisions", "{}.csv".format(seq)) if args.gru_log_decisions else None)
         write_results_no_score(os.path.join(results_folder, "{}.txt".format(seq)), results)
         n = len(dets)
         timing[seq] = {"frames": n, "det_time_s": det_time, "track_time_s": track_time,
