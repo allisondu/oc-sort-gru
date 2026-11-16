@@ -142,11 +142,20 @@ def detect_sequence(model, half, device, exp, img_files, partial_file, save_ever
     return dets, img_hw, det_time
 
 
-def track_sequence(args, dets, img_hw, img_size):
+def build_tracker(args, gru_predictor=None):
+    """Same OC-SORT hyper-parameters for both trackers; only the class differs."""
+    kwargs = dict(iou_threshold=args.iou_thresh, asso_func=args.asso, delta_t=args.deltat,
+                  inertia=args.inertia, use_byte=args.use_byte)
+    if args.tracker == "ocsort":
+        return OCSort(det_thresh=args.track_thresh, **kwargs)
+    from trackers.ocsort_gru import OCSortGRU
+    return OCSortGRU(det_thresh=args.track_thresh, predictor=gru_predictor,
+                     max_gap=args.gru_max_gap, min_obs=args.gru_min_obs, **kwargs)
+
+
+def track_sequence(args, dets, img_hw, img_size, gru_predictor=None):
     """Mirrors the tracking part of MOTEvaluatorDance.evaluate_ocsort."""
-    tracker = OCSort(det_thresh=args.track_thresh, iou_threshold=args.iou_thresh,
-                     asso_func=args.asso, delta_t=args.deltat, inertia=args.inertia,
-                     use_byte=args.use_byte)
+    tracker = build_tracker(args, gru_predictor)
     results = []
     t0 = time.time()
     for frame_id in sorted(dets):
@@ -161,7 +170,10 @@ def track_sequence(args, dets, img_hw, img_size):
                 online_tlwhs.append(tlwh)
                 online_ids.append(tid)
         results.append((frame_id, online_tlwhs, online_ids))
-    return results, time.time() - t0
+    elapsed = time.time() - t0
+    if getattr(tracker, "stats", None):
+        logger.info("  GRU usage: {}".format(tracker.stats))
+    return results, elapsed
 
 
 def main():
@@ -176,7 +188,19 @@ def main():
                         help="only process the first N frames of each sequence (smoke tests)")
     parser.add_argument("--save_every", type=int, default=25, help="checkpoint partial detections every N frames")
     parser.add_argument("--log_every", type=int, default=25)
+    # --- tracker selection (oc-sort-gru). Default reproduces the baseline exactly. ---
+    parser.add_argument("--tracker", choices=["ocsort", "ocsort_gru"], default="ocsort")
+    parser.add_argument("--gru_ckpt", default=None,
+                        help="trained GRU checkpoint (gru_motion.save_checkpoint); required for ocsort_gru. "
+                             "Architecture and history length are read from it.")
+    parser.add_argument("--gru_device", default="cpu", help="device for GRU inference (cpu/cuda/mps)")
+    parser.add_argument("--gru_max_gap", type=int, default=1,
+                        help="use GRU only if the track was observed within this many frames; else Kalman")
+    parser.add_argument("--gru_min_obs", type=int, default=3,
+                        help="minimum real observations in the history window; else Kalman")
     args = parser.parse_args()
+    if args.tracker == "ocsort" and args.gru_ckpt:
+        parser.error("--gru_ckpt given but --tracker is ocsort; pass --tracker ocsort_gru")
 
     exp = get_exp(args.exp_file, args.name)
     if args.conf is not None:
@@ -188,6 +212,21 @@ def main():
     if not args.expn:
         args.expn = exp.exp_name
 
+    # Load + validate the GRU before doing any work, so a missing/untrained
+    # checkpoint fails immediately instead of after detection.
+    gru_predictor = None
+    if args.tracker == "ocsort_gru":
+        from gru_motion import GRUBoxPredictor, GRUCheckpointError
+        try:
+            gru_predictor = GRUBoxPredictor.from_checkpoint(args.gru_ckpt, device=args.gru_device)
+        except GRUCheckpointError as e:
+            logger.error(str(e))
+            sys.exit(2)
+        L = gru_predictor.history_len
+        if not (1 <= args.gru_max_gap <= L - 1 and 2 <= args.gru_min_obs <= L):
+            parser.error("need 1 <= --gru_max_gap <= {} and 2 <= --gru_min_obs <= {} (history_len={})".format(
+                L - 1, L, L))
+
     out_dir = os.path.join(exp.output_dir, args.expn)
     results_folder = os.path.join(out_dir, "{}_{}".format(args.expn, args.split))
     os.makedirs(results_folder, exist_ok=True)
@@ -195,6 +234,17 @@ def main():
     os.makedirs(cache_dir, exist_ok=True)
     logger.add(os.path.join(out_dir, "run_log.txt"), mode="a")
     logger.info("Args: {}".format(args))
+    tracker_cfg = {"tracker": args.tracker, "track_thresh": args.track_thresh, "iou_thresh": args.iou_thresh,
+                   "asso": args.asso, "deltat": args.deltat, "inertia": args.inertia, "use_byte": args.use_byte,
+                   "min_box_area": args.min_box_area}
+    if gru_predictor is not None:
+        tracker_cfg.update({"gru_checkpoint": gru_predictor.meta, "gru_device": args.gru_device,
+                            "gru_max_gap": args.gru_max_gap, "gru_min_obs": args.gru_min_obs})
+        logger.info("GRU checkpoint: {} (sha256 {}, history_len {}, {} params)".format(
+            gru_predictor.meta["path"], gru_predictor.meta["sha256"][:12],
+            gru_predictor.history_len, gru_predictor.meta["num_params"]))
+    with open(os.path.join(out_dir, "tracker_config.json"), "w") as f:
+        json.dump(tracker_cfg, f, indent=2, default=str)
 
     seq_dirs = sorted(glob.glob(os.path.join(args.data_root, args.split, "dancetrack*")))
     if args.seqs:
@@ -237,7 +287,7 @@ def main():
         if len(dets) < n_total:
             logger.warning("{}: tracking only {}/{} frames".format(seq, len(dets), n_total))
 
-        results, track_time = track_sequence(args, dets, img_hw, exp.test_size)
+        results, track_time = track_sequence(args, dets, img_hw, exp.test_size, gru_predictor)
         write_results_no_score(os.path.join(results_folder, "{}.txt".format(seq)), results)
         n = len(dets)
         timing[seq] = {"frames": n, "det_time_s": det_time, "track_time_s": track_time,

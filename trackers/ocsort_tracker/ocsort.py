@@ -194,6 +194,34 @@ class OCSort(object):
         self.use_byte = use_byte
         KalmanBoxTracker.count = 0
 
+    # ------------------------------------------------------------------
+    # Extension hooks (oc-sort-gru). Pure extractions of inline code from
+    # update(); behaviour is identical to upstream. Subclasses (e.g.
+    # trackers/ocsort_gru) override them to change which boxes enter
+    # first-round association without touching the Kalman filter.
+    # ------------------------------------------------------------------
+    def _predict_boxes(self):
+        """
+        Advance every track's Kalman filter by one step and return the predicted
+        boxes as an (N, 5) array of [x1, y1, x2, y2, 0], row-aligned with
+        self.trackers. Tracks whose prediction is NaN are removed.
+        """
+        trks = np.zeros((len(self.trackers), 5))
+        to_del = []
+        for t, trk in enumerate(trks):
+            pos = self.trackers[t].predict()[0]
+            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+            if np.any(np.isnan(pos)):
+                to_del.append(t)
+        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+        for t in reversed(to_del):
+            self.trackers.pop(t)
+        return trks
+
+    def _new_track(self, det):
+        """Create a track from an unmatched detection [x1, y1, x2, y2, score]."""
+        return KalmanBoxTracker(det, delta_t=self.delta_t)
+
     def update(self, output_results, img_info, img_size):
         """
         Params:
@@ -226,17 +254,8 @@ class OCSort(object):
         dets = dets[remain_inds]
 
         # get predicted locations from existing trackers.
-        trks = np.zeros((len(self.trackers), 5))
-        to_del = []
+        trks = self._predict_boxes()
         ret = []
-        for t, trk in enumerate(trks):
-            pos = self.trackers[t].predict()[0]
-            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
-            if np.any(np.isnan(pos)):
-                to_del.append(t)
-        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
-        for t in reversed(to_del):
-            self.trackers.pop(t)
 
         _zero_vel = np.array((0, 0))
         velocities = np.array(
@@ -306,7 +325,7 @@ class OCSort(object):
 
         # create and initialise new trackers for unmatched detections
         for i in unmatched_dets:
-            trk = KalmanBoxTracker(dets[i, :], delta_t=self.delta_t)
+            trk = self._new_track(dets[i, :])
             self.trackers.append(trk)
         i = len(self.trackers)
         for trk in reversed(self.trackers):
