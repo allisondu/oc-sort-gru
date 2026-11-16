@@ -147,3 +147,11 @@ dance_detections/
 
 # IDE
 .vs
+# --- oc-sort-gru: local large / generated artifacts (symlinked or regenerated) ---
+/datasets
+/dance_detections_cache
+/external
+baseline_results/visualizations/*.mp4
+baseline_results/visualizations/*.gif
+baseline_results/det_cache_smoke_*/
+.DS_Store
