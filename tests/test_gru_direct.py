@@ -504,6 +504,78 @@ def test_split_v2_valid_and_reproducible():
     assert len({next(i for i, b in enumerate(bins) if n in b) for n in hold}) == 5
 
 
+# ----------------------------------------------------------------------------- offline evaluation
+
+def _curved_track(n, gap=()):
+    return {f: np.array([300 + 4 * f + 15 * np.sin(f / 4.0), 200 + 3 * np.cos(f / 3.0) * 10,
+                         300 + 4 * f + 15 * np.sin(f / 4.0) + 80 + 0.5 * f, 200 + 3 * np.cos(f / 3.0) * 10 + 200])
+            for f in range(1, n + 1) if f not in gap}
+
+
+def test_eval_const_vel_manual():
+    from gru_motion.eval_offline import pred_const_vel, pred_last_obs
+    hist = np.zeros((1, 10, 4))
+    hist[0, :, :] = [[100 + 3 * k, 50 - 2 * k, 40 + k, 80 + 2 * k] for k in range(10)]
+    hist[0, -2] = [124, 34, 48, 96]          # b(t-2)
+    hist[0, -1] = [130, 30, 49, 99]          # b(t-1)
+    cv, clipped = pred_const_vel(hist.copy())
+    assert np.allclose(cv[0], [136, 26, 50, 102]) and clipped == 0
+    assert np.allclose(pred_last_obs(hist)[0], [130, 30, 49, 99])
+    h2 = hist.copy(); h2[0, -1, 2] = 2; h2[0, -2, 2] = 10
+    cv2, clipped2 = pred_const_vel(h2)
+    assert cv2[0, 2] == 1.0 and clipped2 == 1
+
+
+class _RecordingOCSort(OCSort):
+    def _predict_boxes(self):
+        trks = super()._predict_boxes()
+        self.rec.append(trks.copy())
+        return trks
+
+
+def test_eval_kalman_window_matches_ocsort_tracker():
+    from gru_motion.eval_offline import kalman_window_predict
+    tr = _curved_track(11)
+    hist = np.array([tr[f] for f in range(1, 11)])
+    trk = _RecordingOCSort(det_thresh=0.6)
+    trk.rec = []
+    for f in range(1, 12):                                    # frame 11 = target: tracker predicts before matching
+        trk.update(np.r_[tr[f], 0.95][None], (1080, 1920), (1080, 1920))
+    assert len(trk.trackers) == 1 and trk.trackers[0].hits == 10   # one track, matched every frame
+    assert np.allclose(trk.rec[-1][0, :4], kalman_window_predict(hist), atol=1e-9)
+
+
+def test_eval_kalman_track_matches_ocsort_tracker_with_gap():
+    from gru_motion.eval_offline import kalman_track_predictions
+    tr = _curved_track(40, gap=(15, 16, 17))
+    preds = kalman_track_predictions(tr)
+    trk = _RecordingOCSort(det_thresh=0.6)
+    trk.rec = []
+    for f in range(1, 41):
+        d = np.r_[tr[f], 0.95][None] if f in tr else np.empty((0, 5))
+        trk.update(d, (1080, 1920), (1080, 1920))
+    assert len({t.id for t in trk.trackers}) == 1               # re-associated after the gap (ORU path used)
+    for f in range(2, 41):
+        assert np.allclose(trk.rec[f - 1][0, :4], preds[f], atol=1e-9), f
+    # no leakage: corrupting frames >= t never changes the prediction for t
+    for t in (10, 18, 30):
+        pois = {f: (b + 500.0 if f >= t else b) for f, b in tr.items()}
+        assert np.allclose(kalman_track_predictions(pois)[t], preds[t])
+
+
+def test_eval_gru_matches_predictor_and_model():
+    from gru_motion.features import decode_outputs, encode_windows
+    m = _fixture_model()
+    pred = GRUBoxPredictor(m, 10)
+    rng = np.random.default_rng(0)
+    hist = np.stack([np.c_[500 + np.cumsum(rng.normal(0, 3, 10)), 400 + np.cumsum(rng.normal(0, 3, 10)),
+                           np.full(10, 100.0), np.full(10, 250.0)] for _ in range(7)])
+    mask = np.ones((7, 10))
+    feats, ref = encode_windows(hist, mask)
+    manual = cxcywh_to_xyxy(decode_outputs(m.predict(torch.from_numpy(feats)).numpy(), ref))
+    assert np.allclose(pred.predict_xyxy(hist, mask), manual)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

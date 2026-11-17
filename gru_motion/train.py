@@ -25,6 +25,20 @@ Without holdout sequences only last.pt is written, and only with
 --allow_no_holdout (smoke tests); research runs must have a holdout.
 Holdout loss is computed in eval mode under torch.no_grad(); holdout data
 never produces gradients. Loss is Smooth-L1 on standardised targets; Adam.
+
+Detector-noise augmentation (--box_noise jitter_v1, see gru_motion/augment.py):
+  * history boxes of every training window get fresh size-relative jitter
+    EVERY EPOCH (numpy stream keyed by (--train_noise_seed, epoch)); targets
+    stay the clean GT box, encoded relative to the noisy last observation;
+    masks are unchanged (no missing frames are introduced).
+  * normalisation statistics are computed on the CLEAN training windows (same
+    convention and values as the clean-trained model); noisy inputs are
+    standardised with those statistics.
+  * two holdout losses per epoch on the same holdout windows: clean
+    (`holdout_loss`) and noisy (`holdout_noisy_loss`, ONE fixed perturbation
+    drawn once from --holdout_noise_seed, independent of the training seed).
+  * best.pt is selected on --selection_metric (auto: noisy holdout when noise
+    is enabled, clean holdout otherwise).
 """
 import argparse
 import datetime
@@ -38,10 +52,44 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .data import (DANCETRACK_VAL_SEQUENCES, TRAINING_MODES, SamplingSpec, build_arrays, enumerate_samples,
-                   list_sequences, load_sequences, load_split_config, normalization_stats, subsample)
+from .augment import BoxNoiseConfig, epoch_rng, holdout_rng, perturb_windows
+from .data import (DANCETRACK_VAL_SEQUENCES, TRAINING_MODES, SamplingSpec, build_raw_windows, encode_raw,
+                   enumerate_samples, list_sequences, load_sequences, load_split_config, normalization_stats,
+                   subsample)
 from .features import FEATURE_VERSION
 from .model import GRUMotionModel, save_checkpoint
+
+
+# Named noise presets. jitter_v1 is a MODELLING ASSUMPTION (no train-split detector
+# outputs were available to fit it): ~2.5% of box size per coordinate, i.i.d. per frame.
+NOISE_PRESETS = {
+    "none": BoxNoiseConfig(),
+    "jitter_v1": BoxNoiseConfig(center_x_std=0.025, center_y_std=0.025, log_w_std=0.025, log_h_std=0.025,
+                                apply_prob=1.0, clip_sigma=3.0),
+}
+SELECTION_METRICS = ("auto", "holdout_clean", "holdout_noisy")
+
+
+def noise_config(args):
+    base = NOISE_PRESETS[args.box_noise].to_dict()
+    for k in ("center_x_std", "center_y_std", "log_w_std", "log_h_std", "apply_prob", "clip_sigma"):
+        v = getattr(args, "noise_" + k)
+        if v is not None:
+            base[k] = v
+    return BoxNoiseConfig.from_dict(base)
+
+
+def noise_realised(clean, noisy, mask):
+    """Summary of the perturbation actually applied (valid slots only)."""
+    m = mask > 0
+    c, n = clean[m], noisy[m]
+    changed = np.any(n != c, axis=-1)
+    return {"frac_slots_perturbed": float(changed.mean()),
+            "frac_windows_perturbed": float(np.any(np.any(noisy != clean, axis=-1), axis=-1).mean()),
+            "std_dcx_over_w": float(((n[:, 0] - c[:, 0]) / c[:, 2]).std()),
+            "std_dcy_over_h": float(((n[:, 1] - c[:, 1]) / c[:, 3]).std()),
+            "std_dlogw": float(np.log(n[:, 2] / c[:, 2]).std()),
+            "std_dlogh": float(np.log(n[:, 3] / c[:, 3]).std())}
 
 
 def pick_device(name):
@@ -107,6 +155,18 @@ def main(argv=None):
                     help="smoke tests only: train without holdout; writes last.pt only (no best.pt)")
     ap.add_argument("--early_stop_patience", type=int, default=0,
                     help="stop after N epochs without holdout improvement (0 = off, default)")
+    ap.add_argument("--box_noise", choices=sorted(NOISE_PRESETS), default="none",
+                    help="detector-like localisation noise on history boxes (training + noisy holdout)")
+    for k, h in (("center_x_std", "cx std, fraction of box width"), ("center_y_std", "cy std, fraction of height"),
+                 ("log_w_std", "log-width std"), ("log_h_std", "log-height std"),
+                 ("apply_prob", "probability a training window is perturbed"),
+                 ("clip_sigma", "truncate draws at +-k std (0 = off)")):
+        ap.add_argument("--noise_" + k, type=float, default=None, help="override preset: " + h)
+    ap.add_argument("--train_noise_seed", type=int, default=None, help="training-noise seed (default: --seed)")
+    ap.add_argument("--holdout_noise_seed", type=int, default=542,
+                    help="seed of the fixed noisy-holdout perturbation (keep fixed across runs)")
+    ap.add_argument("--selection_metric", choices=SELECTION_METRICS, default="auto",
+                    help="best.pt criterion; auto = holdout_noisy if noise is enabled else holdout_clean")
     ap.add_argument("--dry_run", action="store_true",
                     help="load data, build windows and normalisation stats, report, then exit (no training, no save)")
     args = ap.parse_args(argv)
@@ -120,6 +180,17 @@ def main(argv=None):
             sys.exit("{} exists; pass --overwrite or choose another --out_dir".format(pth))
     if args.early_stop_patience < 0:
         sys.exit("--early_stop_patience must be >= 0")
+    try:
+        noise = noise_config(args)
+    except ValueError as e:
+        sys.exit(str(e))
+    train_noise_seed = args.seed if args.train_noise_seed is None else args.train_noise_seed
+    sel_metric = args.selection_metric
+    if sel_metric == "auto":
+        sel_metric = "holdout_noisy" if noise.enabled else "holdout_clean"
+    if sel_metric == "holdout_noisy" and not noise.enabled:
+        sys.exit("--selection_metric holdout_noisy requires --box_noise")
+    sel_key = {"holdout_clean": "holdout_loss", "holdout_noisy": "holdout_noisy_loss"}[sel_metric]
 
     t_start = time.time()
     np.random.seed(args.seed)
@@ -168,13 +239,17 @@ def main(argv=None):
     data, seq_info = load_sequences(train_dirs)
     all_samples = enumerate_samples(data, spec)
     samples = subsample(all_samples, args.max_windows, args.seed)
-    feats, targets, _ = build_arrays(data, samples, spec)
+    raw_boxes, raw_masks, raw_tgt = build_raw_windows(data, samples, spec)
+    feats, targets, _ = encode_raw(raw_boxes, raw_masks, raw_tgt)        # CLEAN training windows
     print("mode {} (min_valid_obs {}, max_trailing_gap {}) | train: {} sequences, {} ids, {} candidate "
           "windows -> {} used; feats {} targets {}".format(
               spec.mode, spec.min_valid_obs, spec.max_trailing_gap, len(train_dirs),
               sum(s["ids"] for s in seq_info), len(all_samples), len(samples), feats.shape, targets.shape))
 
-    in_mean, in_std, out_mean, out_std = normalization_stats(feats, targets)
+    in_mean, in_std, out_mean, out_std = normalization_stats(feats, targets)   # clean training windows only
+    print("box noise: {}{}".format(noise.to_dict() if noise.enabled else "none (clean GT histories)",
+                                   " | train noise seed {}, holdout noise seed {}".format(
+                                       train_noise_seed, args.holdout_noise_seed) if noise.enabled else ""))
     if args.dry_run:
         nv = feats[..., 4].sum(1)
         print("dry run | holdout sequences: {} | windows with < L observations: {} ({:.2%})".format(
@@ -188,31 +263,75 @@ def main(argv=None):
     model.set_normalization(in_mean, in_std, out_mean, out_std)
     model.to(device)
 
-    x = torch.from_numpy(feats).to(device)
+    x = torch.from_numpy(feats).to(device)                               # clean (eval_train_loss)
     y = model.normalize_targets(torch.from_numpy(targets).to(device))
-    hx = hy = None
+    hx = hy = hxn = hyn = None
+    holdout_noise_info = None
     if hold_dirs:
         hdata, _ = load_sequences(hold_dirs)
         hsamples = enumerate_samples(hdata, spec)
         if not hsamples:
             sys.exit("holdout sequences yield no windows under mode {}".format(spec.mode))
-        hfeats, htargets, _ = build_arrays(hdata, hsamples, spec)
+        hb, hm, ht = build_raw_windows(hdata, hsamples, spec)
+        hfeats, htargets, _ = encode_raw(hb, hm, ht)
         hx = torch.from_numpy(hfeats).to(device)
         hy = model.normalize_targets(torch.from_numpy(htargets).to(device))
+        if noise.enabled:
+            # ONE fixed perturbation of the holdout histories (every window perturbed), drawn once
+            hcfg = BoxNoiseConfig.from_dict(dict(noise.to_dict(), apply_prob=1.0))
+            hbn = perturb_windows(hb, hm, hcfg, holdout_rng(args.holdout_noise_seed))
+            hnf, hnt, _ = encode_raw(hbn, hm, ht)
+            hxn = torch.from_numpy(hnf).to(device)
+            hyn = model.normalize_targets(torch.from_numpy(hnt).to(device))
+            import hashlib
+            holdout_noise_info = {"seed": args.holdout_noise_seed, "config": hcfg.to_dict(),
+                                  "features_sha256": hashlib.sha256(hnf.tobytes()).hexdigest(),
+                                  "realised": noise_realised(hb, hbn, hm)}
+
+    def noisy_train_tensors(epoch):
+        nb = perturb_windows(raw_boxes, raw_masks, noise, epoch_rng(train_noise_seed, epoch))
+        nf, nt, _ = encode_raw(nb, raw_masks, raw_tgt)
+        return (torch.from_numpy(nf).to(device), model.normalize_targets(torch.from_numpy(nt).to(device)),
+                noise_realised(raw_boxes, nb, raw_masks))
 
     # ---- train ----------------------------------------------------------------
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     g = torch.Generator().manual_seed(args.seed)
     params0 = {k: v.detach().clone() for k, v in model.named_parameters()}
-    history = [{"epoch": 0, "eval_train_loss": eval_loss(model, x, y, 4096),
-                "holdout_loss": eval_loss(model, hx, hy, 4096) if hx is not None else None}]
-    print("epoch 0 | eval train {:.5f}{}".format(history[0]["eval_train_loss"], "" if hx is None else
-                                                 " | holdout {:.5f}".format(history[0]["holdout_loss"])))
+    def holdout_losses():
+        return {"holdout_loss": eval_loss(model, hx, hy, 4096) if hx is not None else None,
+                "holdout_noisy_loss": eval_loss(model, hxn, hyn, 4096) if hxn is not None else None}
 
-    selection = {"metric": "holdout Smooth-L1 (beta {}), mean per output element in standardised space, "
-                           "pooled over all holdout windows".format(args.smooth_l1_beta),
-                 "rule": "lowest holdout loss over epochs >= 1; strict improvement, ties keep earliest epoch",
+    def fmt_hold(rec):
+        out = "" if rec["holdout_loss"] is None else " | holdout clean {:.5f}".format(rec["holdout_loss"])
+        if rec["holdout_noisy_loss"] is not None:
+            out += " | holdout noisy {:.5f}".format(rec["holdout_noisy_loss"])
+        return out
+
+    history = [dict({"epoch": 0, "eval_train_loss": eval_loss(model, x, y, 4096)}, **holdout_losses())]
+    print("epoch 0 | eval train (clean) {:.5f}{}".format(history[0]["eval_train_loss"], fmt_hold(history[0])))
+
+    selection = {"metric": "{} Smooth-L1 (beta {}), mean per output element in standardised space, "
+                           "pooled over all holdout windows".format(
+                               "fixed-noise holdout" if sel_metric == "holdout_noisy" else "clean holdout",
+                               args.smooth_l1_beta),
+                 "selection_metric": sel_metric, "loss_key": sel_key,
+                 "rule": "lowest selection loss over epochs >= 1; strict improvement, ties keep earliest epoch",
                  "holdout_sequences": [os.path.basename(d) for d in hold_dirs]}
+    augmentation = None
+    if noise.enabled:
+        augmentation = {"type": "box_localisation_noise", "preset": args.box_noise, "config": noise.to_dict(),
+                        "applied_to": "history observations only (valid slots); masks unchanged; "
+                                      "no missing frames introduced",
+                        "target": "clean GT box at the target frame, encoded relative to the noisy last "
+                                  "observed box",
+                        "resampling": "fresh noise every epoch: numpy default_rng([train_noise_seed, 1, epoch])",
+                        "train_noise_seed": train_noise_seed,
+                        "normalization": "statistics from CLEAN training windows; noisy inputs standardised "
+                                         "with them",
+                        "noisy_holdout": holdout_noise_info,
+                        "parameter_source": "modelling assumption (no train-split detector outputs available); "
+                                            "not fitted to any validation data"}
     common = {
         "tag": args.tag,
         "num_train_windows": len(samples),
@@ -222,13 +341,14 @@ def main(argv=None):
         "sequence_stats": seq_info,
         "data_root": os.path.abspath(args.data_root),
         "sampling": spec.to_dict(),
-        "augmentation": None,
+        "augmentation": augmentation,
         "split": split_info,
         "num_holdout_windows": int(len(hx)) if hx is not None else 0,
         "feature_version": FEATURE_VERSION,
         "normalization": {"in_mean": in_mean.tolist(), "in_std": in_std.tolist(),
                           "out_mean": out_mean.tolist(), "out_std": out_std.tolist(),
-                          "computed_on": "training windows only (valid, non-reference slots)"},
+                          "computed_on": "CLEAN training windows only (valid, non-reference slots)"
+                                         + ("; noisy inputs use these same statistics" if noise.enabled else "")},
         "config": {k: v for k, v in vars(args).items() if k not in ("overwrite",)},
         "seed": args.seed,
         "device": str(device),
@@ -240,30 +360,34 @@ def main(argv=None):
         """Save a checkpoint whose weights come from `weights_epoch`."""
         m = GRUMotionModel(args.hidden_size, args.num_layers, args.dropout)
         m.load_state_dict(state)
-        hl = history[weights_epoch]["holdout_loss"]
+        hr = history[weights_epoch]
         info = dict(common)
         info.update({
             "epochs": weights_epoch,                 # epochs of training behind THESE weights
             "epochs_completed": len(history) - 1,    # epochs run when this file was written
-            "checkpoint": {"kind": kind, "weights_epoch": weights_epoch, "holdout_loss": hl,
-                           "status": status, "selection": selection if kind == "best" else None},
+            "checkpoint": {"kind": kind, "weights_epoch": weights_epoch, "holdout_loss": hr["holdout_loss"],
+                           "holdout_noisy_loss": hr["holdout_noisy_loss"], "selection_metric": sel_metric,
+                           "selection_loss": hr[sel_key], "status": status,
+                           "selection": selection if kind == "best" else None},
             "loss_history": list(history),
             "param_delta_l2": float(sum(((state[k].cpu() - params0[k].cpu()) ** 2).sum().item()
                                         for k in params0) ** 0.5),
             "elapsed_seconds": time.time() - t_start,
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
         })
-        save_checkpoint(path, m, spec.training_conditions(), info)
+        save_checkpoint(path, m, spec.training_conditions(augmentation), info)
         return info
 
     best_loss, best_epoch, best_state, since_best, stopped_early = float("inf"), None, None, 0, False
     for epoch in range(1, args.epochs + 1):
+        te = time.time()
+        xt, yt, realised = (x, y, None) if not noise.enabled else noisy_train_tensors(epoch)
         model.train()
         perm = torch.randperm(len(x), generator=g).to(device)
-        tot, nb, te = 0.0, 0, time.time()
+        tot, nb = 0.0, 0
         for i in range(0, len(x), args.batch_size):
             idx = perm[i:i + args.batch_size]
-            loss = F.smooth_l1_loss(model(x[idx]), y[idx], beta=args.smooth_l1_beta)
+            loss = F.smooth_l1_loss(model(xt[idx]), yt[idx], beta=args.smooth_l1_beta)
             if not torch.isfinite(loss):
                 sys.exit("non-finite loss at epoch {} batch {}".format(epoch, nb))
             opt.zero_grad()
@@ -271,21 +395,23 @@ def main(argv=None):
             opt.step()
             tot += loss.item()
             nb += 1
-        rec = {"epoch": epoch, "train_loss": tot / nb, "eval_train_loss": eval_loss(model, x, y, 4096),
-               "holdout_loss": eval_loss(model, hx, hy, 4096) if hx is not None else None,
-               "seconds": time.time() - te}
+        del xt, yt
+        rec = dict({"epoch": epoch, "train_loss": tot / nb, "eval_train_loss": eval_loss(model, x, y, 4096)},
+                   **holdout_losses())
+        rec["seconds"] = time.time() - te
+        if realised is not None:
+            rec["train_noise"] = realised
         history.append(rec)
-        improved = hx is not None and rec["holdout_loss"] < best_loss
+        improved = hx is not None and rec[sel_key] < best_loss
         if improved:
-            best_loss, best_epoch, since_best = rec["holdout_loss"], epoch, 0
+            best_loss, best_epoch, since_best = rec[sel_key], epoch, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             write(best_path, best_state, "best", best_epoch, "provisional (training in progress)")
         elif hx is not None:
             since_best += 1
-        print("epoch {} | train {:.5f} | eval train {:.5f}{} | {:.2f}s{}".format(
-            epoch, rec["train_loss"], rec["eval_train_loss"],
-            "" if hx is None else " | holdout {:.5f}".format(rec["holdout_loss"]), rec["seconds"],
-            " | best" if improved else ""))
+        print("epoch {} | train{} {:.5f} | eval train (clean) {:.5f}{} | {:.2f}s{}".format(
+            epoch, " (noisy)" if realised else "", rec["train_loss"], rec["eval_train_loss"], fmt_hold(rec),
+            rec["seconds"], " | best" if improved else ""))
         if args.early_stop_patience and since_best >= args.early_stop_patience:
             stopped_early = True
             print("early stop: no holdout improvement for {} epochs".format(since_best))
@@ -300,8 +426,8 @@ def main(argv=None):
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print("last.pt = epoch {}{} | {:.1f}s total".format(
-        last_epoch, "" if best_state is None else " | best.pt = epoch {} (holdout {:.5f})".format(
-            best_epoch, best_loss), time.time() - t_start))
+        last_epoch, "" if best_state is None else " | best.pt = epoch {} ({} {:.5f})".format(
+            best_epoch, sel_metric, best_loss), time.time() - t_start))
     return best_path if best_state is not None else last_path
 
 

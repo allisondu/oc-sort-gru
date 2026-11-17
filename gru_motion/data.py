@@ -35,9 +35,13 @@ frame must itself be annotated (the target is always a real GT box).
                 past the last observation. Expressible with the same spec
                 (max_trailing_gap > 0) but deliberately rejected for now.
 
-Extension point: `augment` callable in build_arrays(boxes, mask, rng) ->
-(boxes, mask), applied to the raw cxcywh window before encoding (jitter,
-observation drop-out). Default is the identity; not used yet.
+Augmentation (gru_motion/augment.py): the raw cxcywh history windows and the
+clean target boxes are built ONCE (build_raw_windows); detector-like noise is
+applied to the history boxes only, then encode_raw() runs the shared encoder.
+The target box is never perturbed; it is encoded relative to the (possibly
+noisy) last observed box, as at inference. The legacy per-window `augment`
+callable of build_arrays(boxes, mask, rng) -> (boxes, mask) is kept for
+backwards compatibility.
 """
 import configparser
 import glob
@@ -94,14 +98,15 @@ class SamplingSpec:
         """Window predicate shared by training sampling and (via checkpoint metadata) inference."""
         return (trailing_missing <= self.max_trailing_gap) and (num_valid >= self.min_valid_obs)
 
-    def training_conditions(self):
-        """Plain-dict description of what the model saw (stored in checkpoints)."""
+    def training_conditions(self, augmentation=None):
+        """Plain-dict description of what the model saw (stored in checkpoints).
+        augmentation: plain-dict description of input noise, or None (clean GT histories)."""
         return {"training_mode": self.mode, "history_len": self.history_len,
                 "min_valid_obs": self.min_valid_obs, "require_full_history": self.require_full_history,
                 "max_trailing_gap": self.max_trailing_gap,
                 "prediction_horizons": list(range(1, self.max_trailing_gap + 2)),
                 "target": "real GT box at the frame immediately after the window",
-                "augmentation": None}
+                "augmentation": augmentation}
 
     def to_dict(self):
         d = asdict(self)
@@ -195,8 +200,11 @@ def subsample(samples, max_windows, seed):
     return [samples[i] for i in idx]
 
 
-def build_arrays(data, samples, spec, augment=None, rng=None):
-    """Encode samples -> (feats (N, L, 5) float32, targets (N, 4) float32, refs (N, 4))."""
+def build_raw_windows(data, samples, spec, augment=None, rng=None):
+    """
+    Raw (unencoded) windows: (boxes (N, L, 4) cxcywh, masks (N, L), clean target
+    boxes (N, 4) cxcywh). The clean GT data is only read, never modified.
+    """
     L = spec.history_len
     n = len(samples)
     boxes = np.zeros((n, L, 4))
@@ -210,9 +218,18 @@ def build_arrays(data, samples, spec, augment=None, rng=None):
         boxes[j], masks[j] = b, m
         x1, y1, x2, y2 = frames[t]
         tgt[j] = [(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1]
+    return boxes, masks, tgt
+
+
+def encode_raw(boxes, masks, tgt):
+    """Shared encoder: -> (feats (N, L, 5) float32, targets (N, 4) float32, refs (N, 4))."""
     feats, ref = encode_windows(boxes, masks)
-    targets = encode_targets(tgt, ref)
-    return feats, targets, ref
+    return feats, encode_targets(tgt, ref), ref
+
+
+def build_arrays(data, samples, spec, augment=None, rng=None):
+    """Encode samples -> (feats (N, L, 5) float32, targets (N, 4) float32, refs (N, 4))."""
+    return encode_raw(*build_raw_windows(data, samples, spec, augment, rng))
 
 
 def normalization_stats(feats, targets, eps=1e-4):
