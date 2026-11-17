@@ -21,7 +21,7 @@ from gru_motion import (GRUBoxPredictor, GRUCheckpointError, GRUMotionModel, bui
 from gru_motion.features import cxcywh_to_xyxy, window_stats, xyxy_to_cxcywh
 from trackers.ocsort_gru import OCSortGRU
 from trackers.ocsort_gru.history import track_window
-from trackers.ocsort_tracker.ocsort import OCSort
+from trackers.ocsort_tracker.ocsort import KalmanBoxTracker, OCSort
 
 
 def test_coordinate_roundtrip():
@@ -574,6 +574,162 @@ def test_eval_gru_matches_predictor_and_model():
     feats, ref = encode_windows(hist, mask)
     manual = cxcywh_to_xyxy(decode_outputs(m.predict(torch.from_numpy(feats)).numpy(), ref))
     assert np.allclose(pred.predict_xyxy(hist, mask), manual)
+
+
+
+# ----------------------------------------------------------------------------- inference optimisation equivalence
+
+class _RefTracker(OCSortGRU):
+    """Pre-optimisation _predict_boxes path: per-track track_window + model.predict under no_grad."""
+    def _predict_boxes(self):
+        import trackers.ocsort_gru.tracker as TG
+        orig = TG.track_windows
+
+        def per_track(trackers, L):
+            boxes, masks = np.zeros((len(trackers), L, 4)), np.zeros((len(trackers), L))
+            for i, t in enumerate(trackers):
+                boxes[i], masks[i] = track_window(t, L)
+            return boxes, masks
+        TG.track_windows = per_track
+        try:
+            return super()._predict_boxes()
+        finally:
+            TG.track_windows = orig
+
+
+class _RefPredictor(object):
+    """Pre-optimisation GRUBoxPredictor.predict_xyxy (torch.no_grad + model.predict)."""
+    def __init__(self, p):
+        self.p, self.support, self.history_len, self.meta = p, p.support, p.history_len, p.meta
+
+    def predict_xyxy(self, boxes, mask):
+        if len(boxes) == 0:
+            return np.zeros((0, 4))
+        feats, ref = encode_windows(boxes, mask)
+        with torch.no_grad():
+            out = self.p.model.predict(torch.from_numpy(feats))
+        return cxcywh_to_xyxy(decode_outputs(out.cpu().numpy().astype(np.float64), ref))
+
+
+def _random_tracks(rng, n):
+    trks = []
+    for _ in range(n):
+        t = KalmanBoxTracker(np.r_[rng.uniform(0, 500, 2), rng.uniform(600, 900, 2), 0.9])
+        t.gru_birth_obs = np.r_[t.get_state()[0], 0.9] if rng.random() < 0.8 else None
+        if t.gru_birth_obs is None:
+            del t.gru_birth_obs
+        age = int(rng.integers(0, 30))
+        t.age = age
+        for k in range(1, age):
+            if rng.random() < 0.7:
+                b = np.r_[rng.uniform(0, 500, 2), rng.uniform(600, 900, 2), 0.9].astype(
+                    np.float32 if rng.random() < 0.5 else np.float64)
+                r = rng.random()
+                if r < 0.03:
+                    b[2] = b[0]                 # zero width -> invalid slot
+                elif r < 0.05:
+                    b[1] = np.nan               # non-finite -> invalid slot
+                t.observations[k] = b
+        trks.append(t)
+    return trks
+
+
+def test_track_windows_matches_per_track():
+    from trackers.ocsort_gru.history import track_windows
+    rng = np.random.default_rng(0)
+    for trial in range(300):
+        trks = _random_tracks(rng, int(rng.integers(0, 12)))
+        for L in (10, 5):
+            b, m = track_windows(trks, L)
+            ref = [track_window(t, L) for t in trks]
+            rb = np.stack([r[0] for r in ref]) if ref else np.zeros((0, L, 4))
+            rm = np.stack([r[1] for r in ref]) if ref else np.zeros((0, L))
+            assert b.dtype == rb.dtype == np.float64 and b.shape == rb.shape
+            assert np.array_equal(b, rb) and np.array_equal(m, rm), trial   # bit-identical
+
+
+def test_predictor_inference_mode_identical():
+    p = GRUBoxPredictor(_fixture_model(3), 10)
+    ref = _RefPredictor(p)
+    rng = np.random.default_rng(1)
+    for n in (0, 1, 7, 33):
+        boxes = np.c_[rng.uniform(100, 900, (n * 10, 2)), rng.uniform(40, 300, (n * 10, 2))].reshape(n, 10, 4)
+        mask = (rng.random((n, 10)) < 0.8).astype(float)
+        if n:
+            mask[:, -1] = 1
+        boxes[mask == 0] = 0
+        assert np.array_equal(p.predict_xyxy(boxes, mask), ref.predict_xyxy(boxes, mask))
+
+
+def _multi_object_dets(seed, n_frames=120):
+    rng = np.random.default_rng(seed)
+    pos = rng.uniform(100, 800, (8, 2)); vel = rng.normal(0, 4, (8, 2))
+    dets = {}
+    for f in range(1, n_frames + 1):
+        pos += vel + rng.normal(0, 1.5, pos.shape)
+        b = np.c_[pos - [30, 70], pos + [30, 70]]
+        keep = rng.random(8) > (0.35 if f % 17 < 4 else 0.08)        # bursts of misses -> gaps
+        d = b[keep] + rng.normal(0, 2, (keep.sum(), 4))
+        dets[f] = np.c_[d, rng.uniform(0.62, 0.99, keep.sum())] if keep.any() else np.empty((0, 5))
+    return dets
+
+
+def _run_tracker(cls, predictor, dets, **kw):
+    trk = cls(det_thresh=0.6, predictor=predictor, log_decisions=True, **kw)
+    outs, trks_seen = [], []
+    orig = trk._predict_boxes
+
+    def spy():
+        r = orig()
+        trks_seen.append(r.copy())
+        return r
+    trk._predict_boxes = spy
+    for f in sorted(dets):
+        outs.append(trk.update(dets[f].copy(), (1000, 1000), (1000, 1000)))
+    return outs, trks_seen, dict(trk.stats), list(trk.decision_log)
+
+
+def test_optimised_tracker_identical_to_reference():
+    """Same first-round boxes, decisions, stats and outputs as the pre-optimisation path.
+    Covers frames with zero / one / many eligible tracks, gaps, births, deaths, Kalman fallback."""
+    predictors = {"fixture": GRUBoxPredictor(_fixture_model(4), 10)}
+    for name, ck in (("std", "gru_runs/standard_v1/seed0_a40/best.pt"),
+                     ("noise", "gru_runs/noise_augmented/standard_v1_seed0_a40/best.pt"),
+                     ("gap", "gru_runs/gap_aware/noise_v1_seed0_a40/best.pt")):
+        path = os.path.join(_ROOT, ck)
+        if os.path.isfile(path):
+            predictors[name] = GRUBoxPredictor.from_checkpoint(path)
+    for name, p in predictors.items():
+        for seed in (0, 1, 2):
+            dets = _multi_object_dets(seed)
+            # run sequentially: KalmanBoxTracker.count is a class-global id counter
+            ref = _run_tracker(_RefTracker, _RefPredictor(p), dets)
+            new = _run_tracker(OCSortGRU, p, dets)
+            assert len(ref[1]) == len(new[1])
+            assert all(np.array_equal(a, b) for a, b in zip(ref[1], new[1])), (name, seed)   # first-round boxes
+            assert all(np.array_equal(a, b) for a, b in zip(ref[0], new[0])), (name, seed)   # outputs + ids
+            assert ref[2] == new[2] and ref[3] == new[3], (name, seed)                        # stats, decisions
+            used = [r for r in new[3] if r[6] == "gru_used"]
+            per_frame = {}
+            for r in used:
+                per_frame[r[0]] = per_frame.get(r[0], 0) + 1
+            assert used and max(per_frame.values()) > 1 and len(new[3]) > len(used)       # mixed eligibility
+            if name == "gap":
+                assert any(r[6] == "gru_used" and r[5] > 1 for r in new[3])               # gap predictions used
+    # always-invalid predictor: identical fallback path
+    class _Nan(object):
+        support, history_len, meta = predictors["fixture"].support, 10, {}
+
+        def predict_xyxy(self, boxes, mask):
+            return np.full((len(boxes), 4), np.nan)
+    dets = _multi_object_dets(5)
+    ref = _run_tracker(_RefTracker, _Nan(), dets)
+    new = _run_tracker(OCSortGRU, _Nan(), dets)
+    assert all(np.array_equal(a, b) for a, b in zip(ref[0], new[0])) and ref[2] == new[2]
+    assert new[2]["fallback_invalid_output"] > 0 and new[2]["gru_used"] == 0
+    # zero tracks / empty frames
+    t = OCSortGRU(det_thresh=0.6, predictor=predictors["fixture"])
+    assert t.update(np.empty((0, 5)), (1000, 1000), (1000, 1000)).shape == (0, 5)
 
 
 if __name__ == "__main__":

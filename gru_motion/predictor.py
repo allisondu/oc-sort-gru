@@ -38,7 +38,9 @@ class GRUBoxPredictor(object):
         if len(boxes) == 0:
             return np.zeros((0, 4))
         feats, ref = encode_windows(boxes, mask)
-        with torch.no_grad():
-            out = self.model.predict(torch.from_numpy(feats).to(self.device))
+        # inference_mode: same ops as model.predict (forward + denormalise), less autograd bookkeeping;
+        # bit-identical outputs (tests/test_gru_direct.py::test_predictor_inference_mode_identical)
+        with torch.inference_mode():
+            out = self.model.denormalize_outputs(self.model(torch.from_numpy(feats).to(self.device)))
         out = out.cpu().numpy().astype(np.float64)
         return cxcywh_to_xyxy(decode_outputs(out, ref))

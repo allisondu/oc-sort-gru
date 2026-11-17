@@ -38,7 +38,7 @@ import numpy as np
 
 from gru_motion.features import window_stats
 from trackers.ocsort_tracker.ocsort import OCSort
-from .history import track_window
+from .history import track_window, track_windows  # noqa: F401  (track_window kept for diagnostics)
 
 STAT_KEYS = ("track_predictions", "gru_used", "fallback_missing_recent_observation",
              "fallback_unsupported_gap", "fallback_insufficient_history", "fallback_history_holes",
@@ -89,10 +89,7 @@ class OCSortGRU(OCSort):
         if n == 0:
             return trks
         L = self.policy["history_len"]
-        boxes = np.zeros((n, L, 4))
-        masks = np.zeros((n, L))
-        for i, trk in enumerate(self.trackers):
-            boxes[i], masks[i] = track_window(trk, L)
+        boxes, masks = track_windows(self.trackers, L)   # batched, bit-identical to per-track track_window
         num_valid, trailing = window_stats(masks)       # trailing == L if no obs in window
 
         decision = np.full(n, "gru_used", dtype=object)
