@@ -39,6 +39,21 @@ Detector-noise augmentation (--box_noise jitter_v1, see gru_motion/augment.py):
     drawn once from --holdout_noise_seed, independent of the training seed).
   * best.pt is selected on --selection_metric (auto: noisy holdout when noise
     is enabled, clean holdout otherwise).
+
+Gap-aware training (--training_mode gap_aware --max_trailing_gap G):
+  * source windows = standard windows (target + all L history slots in GT);
+  * every epoch each source window gets ONE trailing gap g in 0..G, exactly
+    balanced (counts differ by <= 1), drawn from default_rng([seed, 3, epoch]);
+    the last g slots are masked (mask 0, box 0; slot positions kept), noise is
+    applied to observed slots only, the clean target is encoded relative to the
+    last OBSERVED (noisy) box, i.e. horizon g+1;
+  * normalisation + eval_train use ONE fixed balanced gap assignment
+    (default_rng([seed, 4])) of the clean training windows;
+  * holdout: every holdout source window at every g in 0..G, clean and with
+    the fixed noise realisation (noise drawn once on the full windows, then
+    masked, so observed boxes are identical across g); holdout_loss /
+    holdout_noisy_loss = UNWEIGHTED MEAN over g of the per-gap losses
+    (per-gap values in holdout_by_gap); selection as above.
 """
 import argparse
 import datetime
@@ -52,7 +67,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .augment import BoxNoiseConfig, epoch_rng, holdout_rng, perturb_windows
+from .augment import (BoxNoiseConfig, apply_trailing_gaps, balanced_gaps, epoch_rng, fixed_gap_rng, gap_rng,
+                      holdout_rng, perturb_windows)
 from .data import (DANCETRACK_VAL_SEQUENCES, TRAINING_MODES, SamplingSpec, build_raw_windows, encode_raw,
                    enumerate_samples, list_sequences, load_sequences, load_split_config, normalization_stats,
                    subsample)
@@ -129,7 +145,7 @@ def main(argv=None):
     ap.add_argument("--min_valid_obs", type=int, default=None,
                     help="partial mode only (default 3); standard mode always uses history_len")
     ap.add_argument("--max_trailing_gap", type=int, default=0,
-                    help="must be 0 (gap-aware training is not implemented yet)")
+                    help="gap_aware: maximum trailing missing slots (e.g. 3 -> horizons 1..4); must be 0 otherwise")
     ap.add_argument("--split", default="train")
     ap.add_argument("--seqs", nargs="*", default=None)
     ap.add_argument("--max_seqs", type=int, default=None)
@@ -236,11 +252,19 @@ def main(argv=None):
     if clash:
         sys.exit("refusing: sequences {} belong to the DanceTrack validation split".format(clash))
 
+    gap_aware = spec.mode == "gap_aware"
+    src_spec = spec.source_spec()          # gap_aware: enumerate fully observed source windows
+    gaps_list = list(range(spec.max_trailing_gap + 1)) if gap_aware else [0]
     data, seq_info = load_sequences(train_dirs)
-    all_samples = enumerate_samples(data, spec)
+    all_samples = enumerate_samples(data, src_spec)
     samples = subsample(all_samples, args.max_windows, args.seed)
-    raw_boxes, raw_masks, raw_tgt = build_raw_windows(data, samples, spec)
-    feats, targets, _ = encode_raw(raw_boxes, raw_masks, raw_tgt)        # CLEAN training windows
+    raw_boxes, raw_masks, raw_tgt = build_raw_windows(data, samples, src_spec)
+    if gap_aware:
+        fixed_gaps = balanced_gaps(len(samples), spec.max_trailing_gap, fixed_gap_rng(args.seed))
+        fb_, fm_ = apply_trailing_gaps(raw_boxes, raw_masks, fixed_gaps)
+        feats, targets, _ = encode_raw(fb_, fm_, raw_tgt)                # CLEAN, fixed balanced gaps
+    else:
+        feats, targets, _ = encode_raw(raw_boxes, raw_masks, raw_tgt)    # CLEAN training windows
     print("mode {} (min_valid_obs {}, max_trailing_gap {}) | train: {} sequences, {} ids, {} candidate "
           "windows -> {} used; feats {} targets {}".format(
               spec.mode, spec.min_valid_obs, spec.max_trailing_gap, len(train_dirs),
@@ -265,64 +289,97 @@ def main(argv=None):
 
     x = torch.from_numpy(feats).to(device)                               # clean (eval_train_loss)
     y = model.normalize_targets(torch.from_numpy(targets).to(device))
-    hx = hy = hxn = hyn = None
+    hx = hy = None
+    hclean, hnoisy = {}, {}                  # gap -> (x, y) holdout tensors
     holdout_noise_info = None
     if hold_dirs:
+        import hashlib
         hdata, _ = load_sequences(hold_dirs)
-        hsamples = enumerate_samples(hdata, spec)
+        hsamples = enumerate_samples(hdata, src_spec)
         if not hsamples:
             sys.exit("holdout sequences yield no windows under mode {}".format(spec.mode))
-        hb, hm, ht = build_raw_windows(hdata, hsamples, spec)
-        hfeats, htargets, _ = encode_raw(hb, hm, ht)
-        hx = torch.from_numpy(hfeats).to(device)
-        hy = model.normalize_targets(torch.from_numpy(htargets).to(device))
+        hb, hm, ht = build_raw_windows(hdata, hsamples, src_spec)
+        hbn = None
         if noise.enabled:
-            # ONE fixed perturbation of the holdout histories (every window perturbed), drawn once
+            # ONE fixed perturbation of the (full) holdout histories, drawn once; gaps mask it afterwards
             hcfg = BoxNoiseConfig.from_dict(dict(noise.to_dict(), apply_prob=1.0))
             hbn = perturb_windows(hb, hm, hcfg, holdout_rng(args.holdout_noise_seed))
-            hnf, hnt, _ = encode_raw(hbn, hm, ht)
-            hxn = torch.from_numpy(hnf).to(device)
-            hyn = model.normalize_targets(torch.from_numpy(hnt).to(device))
-            import hashlib
+        sha_by_gap = {}
+        for gl in gaps_list:
+            gv = np.full(len(hsamples), gl)
+            cb, cm = apply_trailing_gaps(hb, hm, gv)
+            f_, t_, _ = encode_raw(cb, cm, ht)
+            hclean[gl] = (torch.from_numpy(f_).to(device), model.normalize_targets(torch.from_numpy(t_).to(device)))
+            if hbn is not None:
+                nb_, _ = apply_trailing_gaps(hbn, hm, gv)
+                nf_, nt_, _ = encode_raw(nb_, cm, ht)
+                hnoisy[gl] = (torch.from_numpy(nf_).to(device),
+                              model.normalize_targets(torch.from_numpy(nt_).to(device)))
+                sha_by_gap[str(gl)] = hashlib.sha256(nf_.tobytes()).hexdigest()
+        hx, hy = hclean[0]
+        if hbn is not None:
             holdout_noise_info = {"seed": args.holdout_noise_seed, "config": hcfg.to_dict(),
-                                  "features_sha256": hashlib.sha256(hnf.tobytes()).hexdigest(),
+                                  "features_sha256": sha_by_gap["0"],
                                   "realised": noise_realised(hb, hbn, hm)}
+            if gap_aware:
+                holdout_noise_info["features_sha256_by_gap"] = sha_by_gap
 
     def noisy_train_tensors(epoch):
-        nb = perturb_windows(raw_boxes, raw_masks, noise, epoch_rng(train_noise_seed, epoch))
-        nf, nt, _ = encode_raw(nb, raw_masks, raw_tgt)
-        return (torch.from_numpy(nf).to(device), model.normalize_targets(torch.from_numpy(nt).to(device)),
-                noise_realised(raw_boxes, nb, raw_masks))
+        """Training tensors of one epoch: fresh gap assignment (gap_aware) and fresh noise (if enabled)."""
+        gb, gm, info = raw_boxes, raw_masks, {}
+        if gap_aware:
+            ge = balanced_gaps(len(raw_boxes), spec.max_trailing_gap, gap_rng(args.seed, epoch))
+            gb, gm = apply_trailing_gaps(raw_boxes, raw_masks, ge)
+            info["gap_counts"] = {str(v): int((ge == v).sum()) for v in gaps_list}
+        nb = perturb_windows(gb, gm, noise, epoch_rng(train_noise_seed, epoch)) if noise.enabled else gb
+        nf, nt, _ = encode_raw(nb, gm, raw_tgt)
+        if noise.enabled:
+            info.update(noise_realised(gb, nb, gm))
+        return (torch.from_numpy(nf).to(device), model.normalize_targets(torch.from_numpy(nt).to(device)), info)
 
     # ---- train ----------------------------------------------------------------
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     g = torch.Generator().manual_seed(args.seed)
     params0 = {k: v.detach().clone() for k, v in model.named_parameters()}
     def holdout_losses():
-        return {"holdout_loss": eval_loss(model, hx, hy, 4096) if hx is not None else None,
-                "holdout_noisy_loss": eval_loss(model, hxn, hyn, 4096) if hxn is not None else None}
+        if hx is None:
+            return {"holdout_loss": None, "holdout_noisy_loss": None}
+        c = {gl: eval_loss(model, *hclean[gl], 4096) for gl in gaps_list}
+        n = {gl: eval_loss(model, *hnoisy[gl], 4096) for gl in gaps_list} if hnoisy else {}
+        rec = {"holdout_loss": float(np.mean([c[gl] for gl in gaps_list])),
+               "holdout_noisy_loss": float(np.mean([n[gl] for gl in gaps_list])) if n else None}
+        if gap_aware:
+            rec["holdout_by_gap"] = {str(gl): {"clean": c[gl], "noisy": n.get(gl)} for gl in gaps_list}
+        return rec
 
     def fmt_hold(rec):
         out = "" if rec["holdout_loss"] is None else " | holdout clean {:.5f}".format(rec["holdout_loss"])
         if rec["holdout_noisy_loss"] is not None:
             out += " | holdout noisy {:.5f}".format(rec["holdout_noisy_loss"])
+        if "holdout_by_gap" in rec:
+            out += " | noisy by gap " + " ".join("{}:{:.4f}".format(k, v["noisy"] if v["noisy"] is not None
+                                                                      else v["clean"])
+                                                 for k, v in rec["holdout_by_gap"].items())
         return out
 
     history = [dict({"epoch": 0, "eval_train_loss": eval_loss(model, x, y, 4096)}, **holdout_losses())]
     print("epoch 0 | eval train (clean) {:.5f}{}".format(history[0]["eval_train_loss"], fmt_hold(history[0])))
 
     selection = {"metric": "{} Smooth-L1 (beta {}), mean per output element in standardised space, "
-                           "pooled over all holdout windows".format(
+                           "pooled over all holdout windows{}".format(
                                "fixed-noise holdout" if sel_metric == "holdout_noisy" else "clean holdout",
-                               args.smooth_l1_beta),
+                               args.smooth_l1_beta,
+                               "; gap_aware: UNWEIGHTED MEAN of the per-gap losses over gaps {} (every holdout "
+                               "source window evaluated at every gap)".format(gaps_list) if gap_aware else ""),
                  "selection_metric": sel_metric, "loss_key": sel_key,
                  "rule": "lowest selection loss over epochs >= 1; strict improvement, ties keep earliest epoch",
                  "holdout_sequences": [os.path.basename(d) for d in hold_dirs]}
     augmentation = None
     if noise.enabled:
         augmentation = {"type": "box_localisation_noise", "preset": args.box_noise, "config": noise.to_dict(),
-                        "applied_to": "history observations only (valid slots); masks unchanged; "
-                                      "no missing frames introduced",
+                        "applied_to": ("observed history slots only; masked (gap) slots stay missing"
+                                       if gap_aware else "history observations only (valid slots); masks "
+                                       "unchanged; no missing frames introduced"),
                         "target": "clean GT box at the target frame, encoded relative to the noisy last "
                                   "observed box",
                         "resampling": "fresh noise every epoch: numpy default_rng([train_noise_seed, 1, epoch])",
@@ -332,6 +389,21 @@ def main(argv=None):
                         "noisy_holdout": holdout_noise_info,
                         "parameter_source": "modelling assumption (no train-split detector outputs available); "
                                             "not fitted to any validation data"}
+    gap_sampling = None
+    if gap_aware:
+        gap_sampling = {"gaps": gaps_list, "max_trailing_gap": spec.max_trailing_gap,
+                        "source_windows": "standard windows (target and all {} history slots in GT)".format(
+                            spec.history_len),
+                        "distribution": "exactly balanced over gaps {} per epoch (counts differ by <= 1)".format(
+                            gaps_list),
+                        "resampling": "fresh assignment every epoch: numpy default_rng([seed, 3, epoch])",
+                        "masking": "last g slots set missing (mask 0, box 0); slot positions kept; all earlier "
+                                   "slots observed (full prefix); noise only on observed slots",
+                        "normalization_and_eval_train": "one fixed balanced assignment default_rng([seed, 4]) of "
+                                                        "the clean training windows",
+                        "holdout": "every holdout source window at every gap in {}; noisy holdout = one fixed "
+                                   "noise realisation of the full windows, then masked".format(gaps_list),
+                        "seed": args.seed}
     common = {
         "tag": args.tag,
         "num_train_windows": len(samples),
@@ -342,6 +414,7 @@ def main(argv=None):
         "data_root": os.path.abspath(args.data_root),
         "sampling": spec.to_dict(),
         "augmentation": augmentation,
+        "gap_sampling": gap_sampling,
         "split": split_info,
         "num_holdout_windows": int(len(hx)) if hx is not None else 0,
         "feature_version": FEATURE_VERSION,
@@ -375,13 +448,14 @@ def main(argv=None):
             "elapsed_seconds": time.time() - t_start,
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
         })
-        save_checkpoint(path, m, spec.training_conditions(augmentation), info)
+        save_checkpoint(path, m, spec.training_conditions(augmentation, gap_sampling) if gap_aware
+                        else spec.training_conditions(augmentation), info)
         return info
 
     best_loss, best_epoch, best_state, since_best, stopped_early = float("inf"), None, None, 0, False
     for epoch in range(1, args.epochs + 1):
         te = time.time()
-        xt, yt, realised = (x, y, None) if not noise.enabled else noisy_train_tensors(epoch)
+        xt, yt, realised = (x, y, None) if not (noise.enabled or gap_aware) else noisy_train_tensors(epoch)
         model.train()
         perm = torch.randperm(len(x), generator=g).to(device)
         tot, nb = 0.0, 0
@@ -400,7 +474,10 @@ def main(argv=None):
                    **holdout_losses())
         rec["seconds"] = time.time() - te
         if realised is not None:
-            rec["train_noise"] = realised
+            if "gap_counts" in realised:
+                rec["train_gap_counts"] = realised.pop("gap_counts")
+            if realised:
+                rec["train_noise"] = realised
         history.append(rec)
         improved = hx is not None and rec[sel_key] < best_loss
         if improved:

@@ -105,3 +105,45 @@ def epoch_rng(seed, epoch):
 def holdout_rng(seed):
     """Generator for the fixed noisy-holdout set (stream disjoint from all training epochs)."""
     return np.random.default_rng([int(seed), 2])
+
+
+# ----------------------------------------------------------------------------- observation gaps
+
+def balanced_gaps(n, max_gap, rng):
+    """
+    Deterministic, exactly balanced assignment of trailing-gap lengths 0..max_gap to
+    n windows (counts differ by at most 1), in random order drawn from `rng`.
+    """
+    g = np.arange(n) % (max_gap + 1)
+    return g[rng.permutation(n)]
+
+
+def apply_trailing_gaps(boxes, mask, gaps):
+    """
+    Mark the last gaps[i] slots of window i as MISSING: mask 0 and box zeros (the
+    canonical missing-slot encoding of features.build_window). Slot positions are
+    kept (no temporal compression). Returns NEW (boxes, mask); inputs are not modified.
+    Windows must keep at least one observed slot.
+    """
+    boxes = np.array(boxes, dtype=np.float64, copy=True)
+    mask = np.array(mask, dtype=np.float64, copy=True)
+    gaps = np.asarray(gaps, dtype=int)
+    L = mask.shape[1]
+    if np.any(gaps < 0) or np.any(gaps >= L):
+        raise ValueError("gap lengths must be in [0, history_len - 1]")
+    drop = np.arange(L)[None, :] >= (L - gaps)[:, None]          # (B, L) trailing slots to drop
+    mask[drop] = 0.0
+    boxes[drop] = 0.0
+    if np.any(mask.sum(1) < 1):
+        raise ValueError("every window needs at least one observed slot")
+    return boxes, mask
+
+
+def gap_rng(seed, epoch):
+    """Generator for the training gap assignment of one epoch (stream 3, disjoint from noise streams 1/2)."""
+    return np.random.default_rng([int(seed), 3, int(epoch)])
+
+
+def fixed_gap_rng(seed):
+    """Generator for the FIXED gap assignment used for normalisation / clean eval-train (stream 4)."""
+    return np.random.default_rng([int(seed), 4])

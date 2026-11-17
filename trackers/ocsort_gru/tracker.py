@@ -24,7 +24,13 @@ Eligibility = the checkpoint's inference_support, optionally narrowed at runtime
                                                if the limit is 0, else fallback_unsupported_gap)
   2. num_valid >= min_valid_obs              (else fallback_insufficient_history)
      (standard checkpoints have min_valid_obs = L, i.e. full history)
-  3. decoded box finite with positive size   (else fallback_invalid_output)
+  3. if require_full_prefix (gap-aware checkpoints): every slot before the
+     trailing gap observed, num_valid == L - trailing gap
+                                             (else fallback_history_holes)
+  4. decoded box finite with positive size   (else fallback_invalid_output)
+Prediction horizon = frames since the last observation = trk.time_since_update
+after predict() = trailing gap + 1 (logged as frames_since_last_obs).
+Gap-aware checkpoints (max_trailing_gap 3) therefore predict horizons 1..4.
 Runtime settings may only be MORE restrictive than the checkpoint; anything
 broader raises ValueError (never silently widened or clipped).
 """
@@ -35,7 +41,8 @@ from trackers.ocsort_tracker.ocsort import OCSort
 from .history import track_window
 
 STAT_KEYS = ("track_predictions", "gru_used", "fallback_missing_recent_observation",
-             "fallback_unsupported_gap", "fallback_insufficient_history", "fallback_invalid_output")
+             "fallback_unsupported_gap", "fallback_insufficient_history", "fallback_history_holes",
+             "fallback_invalid_output")
 DECISION_COLUMNS = ("frame", "track_id", "track_age", "total_observations", "num_valid_in_window",
                     "frames_since_last_obs", "decision")
 
@@ -55,8 +62,11 @@ def effective_policy(support, min_obs=None, max_trailing_gap=None):
     if gap < 0 or gap > support["max_trailing_gap"]:
         raise ValueError("max_trailing_gap={} not allowed: checkpoint supports at most {}".format(
             gap, support["max_trailing_gap"]))
-    return {"history_len": L, "min_valid_obs": mv, "max_trailing_gap": gap,
-            "require_full_history": mv == L, "prediction_horizons": list(range(1, gap + 2))}
+    pol = {"history_len": L, "min_valid_obs": mv, "max_trailing_gap": gap,
+           "require_full_history": mv == L, "prediction_horizons": list(range(1, gap + 2))}
+    if support.get("require_full_prefix", False):
+        pol["require_full_prefix"] = True        # never dropped at runtime (training had no holes)
+    return pol
 
 
 class OCSortGRU(OCSort):
@@ -91,7 +101,11 @@ class OCSortGRU(OCSort):
                              else "fallback_unsupported_gap")
         hist_bad = ~gap_bad & (num_valid < self.policy["min_valid_obs"])
         decision[hist_bad] = "fallback_insufficient_history"
-        eligible = np.flatnonzero(~gap_bad & ~hist_bad)
+        holes = np.zeros(n, dtype=bool)
+        if self.policy.get("require_full_prefix", False):
+            holes = ~gap_bad & ~hist_bad & (num_valid + trailing != L)
+            decision[holes] = "fallback_history_holes"
+        eligible = np.flatnonzero(~gap_bad & ~hist_bad & ~holes)
 
         if len(eligible):
             pred = self.predictor.predict_xyxy(boxes[eligible], masks[eligible])

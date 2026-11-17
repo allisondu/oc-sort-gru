@@ -25,9 +25,12 @@ loads with torch.load(weights_only=True)):
                          prediction_horizons, target, augmentation}
     inference_support    what the tracker MAY SUBMIT: {history_len,
                          min_valid_obs, require_full_history,
-                         max_trailing_gap, prediction_horizons}; must be no
-                         broader than training_conditions (validated on save
-                         and on load)
+                         max_trailing_gap, prediction_horizons
+                         [, require_full_prefix]}; must be no broader than
+                         training_conditions (validated on save and on load).
+                         require_full_prefix (optional, default False; written
+                         by gap_aware training): every slot before the
+                         trailing gap must be observed.
     train_info           provenance: epochs, num_train_windows, sequences,
                          split hash, seed, git commit, losses, ...
 
@@ -48,6 +51,7 @@ CHECKPOINT_FORMAT = "oc-sort-gru/motion-checkpoint/v2"
 LEGACY_FORMATS = ("oc-sort-gru/motion-checkpoint/v1",)
 SUPPORT_KEYS = ("history_len", "min_valid_obs", "require_full_history", "max_trailing_gap",
                 "prediction_horizons")
+OPTIONAL_SUPPORT_KEYS = ("require_full_prefix",)     # absent == False (all pre-gap-aware checkpoints)
 DEFAULT_MODEL_CONFIG = {"hidden_size": 64, "num_layers": 1, "dropout": 0.0}
 DEFAULT_HISTORY_LEN = 10
 
@@ -100,7 +104,11 @@ class GRUMotionModel(nn.Module):
 
 def support_from_training(training_conditions):
     """Default inference support = exactly the conditions the model was trained on."""
-    return {k: training_conditions[k] for k in SUPPORT_KEYS}
+    s = {k: training_conditions[k] for k in SUPPORT_KEYS}
+    for k in OPTIONAL_SUPPORT_KEYS:
+        if training_conditions.get(k):
+            s[k] = training_conditions[k]
+    return s
 
 
 def conservative_support(history_len):
@@ -124,6 +132,11 @@ def validate_support(support, history_len, training_conditions=None):
         raise ValueError("inference_support.max_trailing_gap must be an int in [0, {}]".format(L - 1))
     if list(support["prediction_horizons"]) != list(range(1, gap + 2)):
         raise ValueError("prediction_horizons must be 1..max_trailing_gap+1")
+    prefix = support.get("require_full_prefix", False)
+    if not isinstance(prefix, bool):
+        raise ValueError("require_full_prefix must be a bool")
+    if prefix and mv > L - gap:
+        raise ValueError("require_full_prefix with min_valid_obs {} admits no window at gap {}".format(mv, gap))
     if training_conditions is not None:
         tc = training_conditions
         if tc.get("history_len") != L:
@@ -134,6 +147,9 @@ def validate_support(support, history_len, training_conditions=None):
         if gap > tc.get("max_trailing_gap", 0):
             raise ValueError("support max_trailing_gap {} exceeds what training saw ({})".format(
                 gap, tc.get("max_trailing_gap")))
+        if tc.get("require_full_prefix", False) and not prefix:
+            raise ValueError("training used only full-prefix windows (no holes before the gap); "
+                             "support must keep require_full_prefix=True")
 
 
 def save_checkpoint(path, model, training_conditions, train_info, inference_support=None):

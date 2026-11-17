@@ -31,9 +31,13 @@ frame must itself be annotated (the target is always a real GT box).
                 slots may be missing (masked, temporal position preserved), but
                 slot L-1 (frame target-1) must be observed (trailing gap 0,
                 horizon 1). Includes full windows as a special case.
-  * future "gap_aware": trailing gap > 0, i.e. predicting more than one frame
-                past the last observation. Expressible with the same spec
-                (max_trailing_gap > 0) but deliberately rejected for now.
+  * "gap_aware": source windows are STANDARD (all L slots + target observed);
+                during training the last g in {0..max_trailing_gap} slots are
+                masked (gru_motion.augment.apply_trailing_gaps), so the model
+                predicts g+1 frames past its last observation. Every slot
+                before the gap stays observed ("full prefix"): the trained
+                support is trailing gap <= max_trailing_gap AND
+                num_valid == L - trailing gap (require_full_prefix).
 
 Augmentation (gru_motion/augment.py): the raw cxcywh history windows and the
 clean target boxes are built ONCE (build_raw_windows); detector-like noise is
@@ -58,7 +62,7 @@ from .features import build_window, encode_targets, encode_windows, window_stats
 DANCETRACK_VAL_SEQUENCES = frozenset("dancetrack{:04d}".format(i) for i in (
     4, 5, 7, 10, 14, 18, 19, 25, 26, 30, 34, 35, 41, 43, 47, 58, 63, 65, 73, 77, 79, 81, 90, 94, 97))
 
-TRAINING_MODES = ("standard", "partial")
+TRAINING_MODES = ("standard", "partial", "gap_aware")
 
 
 @dataclass(frozen=True)
@@ -67,15 +71,22 @@ class SamplingSpec:
     history_len: int = 10
     min_valid_obs: int = 10        # standard: forced to history_len
     max_trailing_gap: int = 0      # missing frames between last observation and target
+    require_full_prefix: bool = False   # gap_aware: all slots before the trailing gap observed
 
     @classmethod
     def make(cls, mode, history_len=10, min_valid_obs=None, max_trailing_gap=0):
         """Validated constructor. min_valid_obs=None -> mode default (L for standard, 3 for partial)."""
         if mode not in TRAINING_MODES:
-            raise ValueError("training mode must be one of {} (gap-aware is not implemented yet)".format(
-                TRAINING_MODES))
+            raise ValueError("training mode must be one of {}".format(TRAINING_MODES))
         if history_len < 2:
             raise ValueError("history_len must be >= 2")
+        if mode == "gap_aware":
+            if not (1 <= max_trailing_gap <= history_len - 2):
+                raise ValueError("gap_aware mode needs 1 <= max_trailing_gap <= history_len - 2")
+            if min_valid_obs not in (None, history_len - max_trailing_gap):
+                raise ValueError("gap_aware mode keeps every slot before the gap observed; min_valid_obs is "
+                                 "fixed to history_len - max_trailing_gap = {}".format(history_len - max_trailing_gap))
+            return cls(mode, int(history_len), int(history_len - max_trailing_gap), int(max_trailing_gap), True)
         if max_trailing_gap != 0:
             raise ValueError("max_trailing_gap > 0 means gap-aware (multi-frame-horizon) training, "
                              "which is not implemented yet; use 0")
@@ -96,21 +107,37 @@ class SamplingSpec:
 
     def accepts(self, num_valid, trailing_missing):
         """Window predicate shared by training sampling and (via checkpoint metadata) inference."""
-        return (trailing_missing <= self.max_trailing_gap) and (num_valid >= self.min_valid_obs)
+        ok = (trailing_missing <= self.max_trailing_gap) and (num_valid >= self.min_valid_obs)
+        if self.require_full_prefix:
+            ok = ok and (num_valid + trailing_missing == self.history_len)
+        return ok
 
-    def training_conditions(self, augmentation=None):
+    def source_spec(self):
+        """Spec used to ENUMERATE source windows (gap_aware: fully observed standard windows)."""
+        return SamplingSpec.make("standard", self.history_len) if self.mode == "gap_aware" else self
+
+    def training_conditions(self, augmentation=None, gap_sampling=None):
         """Plain-dict description of what the model saw (stored in checkpoints).
-        augmentation: plain-dict description of input noise, or None (clean GT histories)."""
-        return {"training_mode": self.mode, "history_len": self.history_len,
-                "min_valid_obs": self.min_valid_obs, "require_full_history": self.require_full_history,
-                "max_trailing_gap": self.max_trailing_gap,
-                "prediction_horizons": list(range(1, self.max_trailing_gap + 2)),
-                "target": "real GT box at the frame immediately after the window",
-                "augmentation": augmentation}
+        augmentation: plain-dict description of input noise, or None (clean GT histories).
+        gap_sampling: gap_aware only - how trailing gaps were drawn."""
+        tc = {"training_mode": self.mode, "history_len": self.history_len,
+              "min_valid_obs": self.min_valid_obs, "require_full_history": self.require_full_history,
+              "max_trailing_gap": self.max_trailing_gap,
+              "prediction_horizons": list(range(1, self.max_trailing_gap + 2)),
+              "target": "real GT box at the frame immediately after the window",
+              "augmentation": augmentation}
+        if self.mode == "gap_aware":
+            tc["require_full_prefix"] = True
+            tc["target"] = ("real GT box at the frame immediately after the window; the last observation is "
+                            "g+1 frames before it for a trailing gap of g masked slots")
+            tc["gap_sampling"] = gap_sampling
+        return tc
 
     def to_dict(self):
         d = asdict(self)
         d["require_full_history"] = self.require_full_history
+        if not self.require_full_prefix:
+            d.pop("require_full_prefix")      # keep standard/partial metadata unchanged
         return d
 
 
